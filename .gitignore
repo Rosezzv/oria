@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.oria/
+.env
+.env.*
+*.tgz
+.DS_Store

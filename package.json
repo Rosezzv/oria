@@ -1,0 +1,40 @@
+{
+  "name": "oria-local",
+  "version": "0.1.0-alpha.1",
+  "description": "Local-first Markdown knowledge across agents",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "oria": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "scripts/install.sh",
+    "README.md",
+    "ARCHITECTURE.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && node --input-type=module -e \"import { chmodSync } from 'node:fs'; chmodSync('dist/cli.js', 0o755)\"",
+    "test": "npm run build && node --test",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "yaml": "2.9.1",
+    "yauzl": "3.4.0",
+    "yazl": "3.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/yauzl": "^2.10.3",
+    "@types/yazl": "^3.3.0",
+    "typescript": "5.9.3"
+  }
+}
