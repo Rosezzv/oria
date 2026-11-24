@@ -8,10 +8,11 @@ import * as yazl from 'yazl';
 import { z } from 'zod';
 import { digest, hashSchema, limits, manifestName, OriaError } from './domain.js';
 import {
-  checkDirectory, checkExternalFile, cleanOsMetadata, flushDirectory, portableKey, readChecked, stat, validatePath, walkTree, writeNewFile,
+  checkDirectory, checkExternalFile, flushDirectory, portableKey, readChecked, stat, validatePath, walkTree, writeNewFile,
 } from './filesystem.js';
 import { historyEntries, isHistoryPath, readHistory } from './history.js';
 import { loadNotes, type Vault } from './vault.js';
+import { assertNoRecoveryCopies } from './replacement.js';
 
 const recordSchema = z.discriminatedUnion('kind', [
   z.strictObject({ path: z.string(), kind: z.literal('directory') }),
@@ -64,7 +65,7 @@ function sameEntries(left: RecordEntry[], right: RecordEntry[], exactPaths = fal
 
 function snapshot(root: string, files?: Map<string, Buffer>): RecordEntry[] {
   let total = 0;
-  const tree = walkTree(root);
+  const tree = walkTree(root, { forBackup: true });
   const entries = tree.map((entry): RecordEntry => {
     const { relativePath: path, absolutePath } = entry;
     if (entry.directory) return { path, kind: 'directory' };
@@ -85,7 +86,10 @@ function snapshot(root: string, files?: Map<string, Buffer>): RecordEntry[] {
 
 export async function exportVault(vault: Vault) {
   const files = new Map<string, Buffer>();
-  const entries = vault.transaction(() => snapshot(vault.paths.library, files));
+  const entries = vault.transaction(() => {
+    assertNoRecoveryCopies(vault.paths);
+    return snapshot(vault.paths.library, files);
+  });
   const manifest: Manifest = {
     format: 'oria-vault', version: 2, exported_at: new Date().toISOString(), entries,
   };
@@ -239,7 +243,7 @@ async function validateZip(zip: yauzl.ZipFile, staging: string): Promise<Manifes
   if (!sameEntries(records, manifest.entries, true)) {
     throw new OriaError('INVALID_BACKUP', 'ZIP contents do not match the ORIA manifest');
   }
-  const tree = walkTree(staging);
+  const tree = walkTree(staging, { forBackup: true });
   if (manifest.version === 1 && tree.some(entry => isHistoryPath(entry.relativePath))) {
     throw new OriaError('INVALID_BACKUP', 'Backup format 1 uses the path reserved for ORIA history');
   }
@@ -258,28 +262,32 @@ export async function importVault(vault: Vault, backupPath: string) {
   mkdirSync(stagedLibrary, { mode: 0o700 });
   try {
     const manifest = await extractBackup(resolve(backupPath), stagedLibrary);
-    return vault.transaction(db => {
+    return vault.transaction(() => {
+      assertNoRecoveryCopies(vault.paths);
       const library = vault.paths.library;
       const libraryExists = checkDirectory(library);
       const existing = snapshot(library);
       // only treat as unchanged when library already exists (not a fresh uninitialized vault).
       if (libraryExists && sameEntries(existing, manifest.entries) &&
         manifest.entries.every(entry => stat(join(library, ...entry.path.split('/'))))) {
-        return { status: 'unchanged', entries: existing.length, format_version: manifest.version };
+        return { status: 'unchanged', entries: existing.length, format_version: manifest.version, index_status: 'rebuild_on_search' };
       }
       if (existing.length) {
         throw new OriaError('IMPORT_CONFLICT', 'Vault already contains different data. Restore into a new vault directory.');
       }
-      if (libraryExists) {
-        // remove OS metadata files (e.g. .DS_Store) so empty library rmdir succeeds.
-        cleanOsMetadata(library);
-        rmdirSync(library);
-      }
+      // rmdir will fail if an external process has added any file since the scan.
+      if (libraryExists) rmdirSync(library);
       renameSync(stagedLibrary, library);
-      flushDirectory(vault.paths.root);
-      // eagerly rebuild FTS5 index inside the import transaction.
-      vault.rebuildIndex(db);
-      return { status: 'imported', entries: manifest.entries.length, format_version: manifest.version };
+      try {
+        flushDirectory(vault.paths.root);
+      } catch {
+        // The namespace change already happened. Report that fact without
+        // claiming the directory entry is durable across power loss.
+        return { status: 'imported', entries: manifest.entries.length, format_version: manifest.version,
+          index_status: 'rebuild_on_search', durability_warning: 'Could not flush the vault directory after publishing.' };
+      }
+      return { status: 'imported', entries: manifest.entries.length, format_version: manifest.version,
+        index_status: 'rebuild_on_search' };
     });
   } finally {
     rmSync(stage, { recursive: true, force: true });

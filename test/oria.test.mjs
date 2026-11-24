@@ -2,11 +2,12 @@ import { strict as assert } from 'node:assert';
 import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync,
-  truncateSync, writeFileSync,
+  closeSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync,
+  openSync, rmdirSync, statSync, truncateSync, writeFileSync, writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import test from 'node:test';
@@ -217,7 +218,7 @@ test('ZIP restores unchanged notes, attachments, empty directories, and a rebuil
   assert.equal(succeeds(target, ['history', note.id]).total, 1);
   assert.deepEqual(succeeds(target, ['search', '备份测试']), []);
   assert.deepEqual(readdirSync(join(target, 'library', 'attachments', '空目录')), []);
-  assert.deepEqual(readdirSync(join(target, '.oria')).sort(), ['staging', 'state.sqlite']);
+  assert.ok(existsSync(join(target, '.oria', 'state.sqlite')));
   rmSync(join(target, '.oria', 'state.sqlite'));
   assert.equal(succeeds(target, ['search', '跨电脑'])[0].id, note.id);
   assert.equal(succeeds(target, ['import', backup.path]).status, 'unchanged');
@@ -362,7 +363,8 @@ test('project paths, symlinks and hard links cannot redirect vault access', t =>
     assert.equal(cli(vault, ['save', '--title', 'X', '--project', 'redirect'], { input: 'test' }).failed.code, 'UNSAFE_PATH');
     rmSync(join(vault, 'library', 'redirect'));
     symlinkSync(outsideFile, join(vault, '.oria', 'state.sqlite-journal'));
-    assert.equal(cli(vault, ['read', note.id]).failed.code, 'UNSAFE_PATH');
+    assert.equal(cli(vault, ['search', 'vault']).failed.code, 'UNSAFE_PATH');
+    assert.equal(succeeds(vault, ['read', note.id]).body, 'stay in vault');
     rmSync(join(vault, '.oria', 'state.sqlite-journal'));
   }
   assert.equal(succeeds(vault, ['read', note.id]).body, 'stay in vault');
@@ -506,33 +508,35 @@ test('MCP tool schemas avoid RE2-incompatible regexes and nullable anyOf, and cl
   assert.equal(badControl.isError, true);
 });
 
-test('OS metadata files (.DS_Store, Icon\\r, ._*) are ignored across read, export, and import', t => {
+test('portable attachments and metadata are preserved; nonportable files and nonempty destinations are refused', t => {
   const root = fixture(t);
   const source = join(root, 'source');
   const target = join(root, 'target');
   const note = save(source, 'Finder test', 'macOS metadata safety', '--project', 'Mac');
-  writeFileSync(join(source, 'library', '.DS_Store'), 'finder-meta-v1');
-  writeFileSync(join(source, 'library', 'Icon\r'), '');
-  writeFileSync(join(source, 'library', '._appledouble'), 'meta');
-  assert.equal(succeeds(source, ['read', note.id]).body, 'macOS metadata safety');
-
-  const exported = succeeds(source, ['export']);
-  // Target has an empty library/ containing only Finder .DS_Store.
-  succeeds(target, ['init']);
-  mkdirSync(join(target, 'library'), { recursive: true });
-  writeFileSync(join(target, 'library', '.DS_Store'), 'target-finder-meta');
-  assert.equal(succeeds(target, ['import', exported.path]).status, 'imported');
-  assert.equal(succeeds(target, ['read', note.id]).body, 'macOS metadata safety');
-
-  // Finder writes a fresh .DS_Store inside restored library; idempotent re-import must stay unchanged.
-  writeFileSync(join(target, 'library', '.DS_Store'), 'finder-meta-v2-changed');
-  assert.equal(succeeds(target, ['import', exported.path]).status, 'unchanged');
-
-  // Symlink named .DS_Store must still be rejected as UNSAFE_PATH.
+  const entries = new Map([['.DS_Store', 'finder-v1'], ['._user-attachment.txt', 'user contents'],
+    ['Desktop.ini', 'portable Windows metadata']]);
+  for (const [name, bytes] of entries) writeFileSync(join(source, 'library', name), bytes);
   if (process.platform !== 'win32') {
-    rmSync(join(target, 'library', '.DS_Store'));
-    symlinkSync(join(root, 'outside-target'), join(target, 'library', '.DS_Store'));
-    assert.equal(cli(target, ['list']).failed.code, 'UNSAFE_PATH');
+    const icon = join(source, 'library', 'Icon\r');
+    writeFileSync(icon, 'nonportable file');
+    assert.equal(succeeds(source, ['read', note.id]).body, 'macOS metadata safety');
+    assert.equal(cli(source, ['export']).failed.code, 'UNSAFE_PATH');
+    assert.equal(readFileSync(icon, 'utf8'), 'nonportable file');
+    rmSync(icon);
+  }
+  const backup = succeeds(source, ['export']);
+  mkdirSync(join(target, 'library'), { recursive: true });
+  writeFileSync(join(target, 'library', '._keep.txt'), 'private target bytes');
+  assert.equal(cli(target, ['import', backup.path]).failed.code, 'IMPORT_CONFLICT');
+  assert.equal(readFileSync(join(target, 'library', '._keep.txt'), 'utf8'), 'private target bytes');
+  const restored = join(root, 'restored');
+  assert.equal(succeeds(restored, ['import', backup.path]).status, 'imported');
+  for (const [name, bytes] of entries) assert.equal(readFileSync(join(restored, 'library', name), 'utf8'), bytes);
+  assert.equal(succeeds(restored, ['import', backup.path]).status, 'unchanged');
+  if (process.platform !== 'win32') {
+    rmSync(join(restored, 'library', '.DS_Store'));
+    symlinkSync(join(root, 'outside-target'), join(restored, 'library', '.DS_Store'));
+    assert.equal(cli(restored, ['export']).failed.code, 'UNSAFE_PATH');
   }
 });
 
@@ -550,7 +554,7 @@ test('secret guard blocks obvious credentials by default, CLI can override, and 
   const root = fixture(t);
   const vault = join(root, 'vault');
   const fakeGh = 'ghp_' + 'A'.repeat(36);
-  const fakePem = '-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----';
+  const fakePem = '-----BEGIN ' + 'PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----';
   assert.equal(cli(vault, ['save', '--title', 'Leak'], { input: 'token: ' + fakeGh }).failed.code, 'SECRET_DETECTED');
   const allowed = succeeds(vault, ['save', '--title', 'Intentional fixture', '--allow-secrets'], { input: 'key: ' + fakePem });
   assert.equal(allowed.created, true);
@@ -635,6 +639,7 @@ test('Grok Bot shares the vault with Claude Code and Codex via local CLI and MCP
   const claude = await mcp(t, vault, 'claude-code');
   const codex = await mcp(t, vault, 'codex');
   const grokMcp = await mcp(t, vault, 'grok-bot');
+  const antigravity = await mcp(t, vault, 'antigravity');
 
   // 1. Grok Bot saves via local CLI (--agent grok-bot) from a non-Git cwd with unsafe project_hint fallback to general.
   const grokSaved = succeeds(vault, [
@@ -692,8 +697,297 @@ test('Grok Bot shares the vault with Claude Code and Codex via local CLI and MCP
   const grokMcpSaved = (await tool(grokMcp, 'save', { title: 'Grok MCP note', body: 'stdio mcp works too' })).document;
   assert.equal(grokMcpSaved.created_by, 'grok-bot');
 
+  const fourth = await tool(antigravity, 'update', {
+    id: claudeSaved.id, expected_revision: envAppended.revision, append: '第四端保留上下文。',
+  });
+  assert.equal(fourth.created_by, 'claude-code');
+  assert.equal(fourth.updated_by, 'antigravity');
+  assert.equal(fourth.path, claudeSaved.path);
   const backup = succeeds(vault, ['export']);
   assert.equal(succeeds(restored, ['import', backup.path]).status, 'imported');
-  assert.equal(succeeds(restored, ['read', claudeSaved.id]).updated_by, 'grok-bot');
-  assert.equal(succeeds(restored, ['history', claudeSaved.id]).total, 2);
+  assert.equal(succeeds(restored, ['read', claudeSaved.id]).updated_by, 'antigravity');
+  assert.equal(succeeds(restored, ['history', claudeSaved.id]).total, 3);
+});
+
+test('corrupt or incompatible SQLite cache never blocks Markdown, import, or history', t => {
+  const root = fixture(t);
+  const source = join(root, 'source');
+  const target = join(root, 'target');
+  const note = save(source, 'Cache fixture', '中文 Recovery');
+  const cache = join(source, '.oria', 'state.sqlite');
+  succeeds(source, ['search', '中文']);
+  writeFileSync(cache, 'invalid cache bytes');
+  assert.equal(succeeds(source, ['read', note.id]).body, '中文 Recovery');
+  const backup = succeeds(source, ['export']);
+  assert.equal(succeeds(source, ['search', '中文 Recovery'])[0].id, note.id);
+
+  succeeds(target, ['init']);
+  const db = new DatabaseSync(join(target, '.oria', 'state.sqlite'));
+  db.exec('PRAGMA user_version=2; CREATE TABLE notes (unexpected TEXT)');
+  db.close();
+  const imported = succeeds(target, ['import', backup.path]);
+  assert.equal(imported.status, 'imported');
+  assert.equal(imported.index_status, 'rebuild_on_search');
+  assert.equal(succeeds(target, ['import', backup.path]).status, 'unchanged');
+  assert.equal(succeeds(target, ['read', note.id]).revision, note.revision);
+  assert.equal(succeeds(target, ['search', 'Recovery'])[0].id, note.id);
+});
+
+test('replacement protects atomic external edits, I/O failures and interrupted publication', t => {
+  const root = fixture(t);
+  const hook = join(root, 'filesystem-fixture.mjs');
+  writeFileSync(hook, [
+    "import fs from 'node:fs';",
+    "import { syncBuiltinESMExports } from 'node:module';",
+    "const { renameSync, linkSync, writeFileSync, readFileSync } = fs;",
+    "const path = process.env.ORIA_TEST_TARGET;",
+    "const fault = process.env.ORIA_TEST_FAULT;",
+    "fs.renameSync = (source, dest) => {",
+    "  if (source === path && fault === 'before-claim') {",
+    "    writeFileSync(path + '.editor', readFileSync(path, 'utf8') + '\\nExternal edit');",
+    "    renameSync(path + '.editor', path);",
+    "  }",
+    "  return renameSync(source, dest);",
+    "};",
+    "fs.linkSync = (source, dest) => {",
+    "  if (dest === path && source.endsWith('next.md')) {",
+    "    if (fault === 'after-claim') writeFileSync(path, 'Independent outside file');",
+    "    if (fault === 'io') throw Object.assign(new Error('simulated I/O failure'), { code: 'EIO' });",
+    "    if (fault === 'interrupt-claim') process.kill(process.pid, 'SIGKILL');",
+    "    if (fault === 'interrupt-link') { linkSync(source, dest); process.kill(process.pid, 'SIGKILL'); }",
+    "  }",
+    "  return linkSync(source, dest);",
+    "};",
+    "syncBuiltinESMExports();",
+  ].join('\n'));
+
+  for (const fault of ['before-claim', 'after-claim', 'io', 'interrupt-claim', 'interrupt-link']) {
+    const vault = join(root, fault);
+    const note = save(vault, 'Failure fixture', 'Keep原文');
+    const path = realpathSync(join(vault, note.path));
+    const result = spawnSync(process.execPath, ['--import', pathToFileURL(hook).href, entrypoint,
+      '--vault', vault, '--json', 'update', note.id, '--expected-revision', note.revision, '--append-file', '-'], {
+      input: 'Requested change', encoding: 'utf8',
+      env: { ...process.env, ORIA_TEST_TARGET: path, ORIA_TEST_FAULT: fault },
+    });
+    if (fault.startsWith('interrupt')) assert.equal(result.signal, 'SIGKILL');
+    else assert.equal(result.status, 1, fault + ': ' + JSON.stringify(result));
+    if (fault === 'after-claim') {
+      assert.equal(JSON.parse(result.stderr).error.code, 'RECOVERY_PENDING');
+      assert.equal(readFileSync(path, 'utf8'), 'Independent outside file');
+      const directory = join(vault, '.oria', 'recovered');
+      const [record] = readdirSync(directory);
+      assert.match(readFileSync(join(directory, record, 'previous.md'), 'utf8'), /Keep原文/);
+      assert.equal(cli(vault, ['export']).failed.code, 'RECOVERY_PENDING');
+    } else {
+      const body = succeeds(vault, ['read', note.id]).body;
+      if (fault === 'before-claim') {
+        assert.equal(JSON.parse(result.stderr).error.code, 'VERSION_CONFLICT');
+        assert.equal(body, 'Keep原文\nExternal edit');
+      } else if (fault === 'interrupt-link') {
+        assert.equal(body, 'Keep原文\n\nRequested change');
+      } else {
+        assert.equal(body, 'Keep原文');
+      }
+      assert.equal(existsSync(join(vault, '.oria', 'replacement')), false);
+    }
+    assert.equal(succeeds(vault, ['read', note.id, '--revision', note.revision]).body, 'Keep原文');
+  }
+});
+
+test('writes through an already-open external descriptor survive as a recovery copy', {
+  skip: process.platform === 'win32' ? 'runtime may deny moving the open file on Windows' : false,
+}, t => {
+  const vault = join(fixture(t), 'vault');
+  const note = save(vault, 'Open-descriptor fixture', 'Original');
+  const fd = openSync(join(vault, note.path), 'a');
+  try {
+    succeeds(vault, ['update', note.id, '--expected-revision', note.revision, '--append-file', '-'],
+      { input: 'ORIA change' });
+    writeSync(fd, '\nLate editor write');
+  } finally {
+    closeSync(fd);
+  }
+  assert.equal(cli(vault, ['read', note.id]).failed.code, 'RECOVERY_PENDING');
+  const dir = join(vault, '.oria', 'recovered');
+  const [record] = readdirSync(dir);
+  assert.match(readFileSync(join(dir, record, 'previous.md'), 'utf8'), /Late editor write/);
+  assert.equal(succeeds(vault, ['read', note.id]).body, 'Original\n\nORIA change');
+  assert.equal(cli(vault, ['export']).failed.code, 'RECOVERY_PENDING');
+});
+
+test('secret guard covers written metadata and restored content, with explicit CLI authorization', async t => {
+  const vault = join(fixture(t), 'vault');
+  const marker = '-----BEGIN ' + 'PRIVATE KEY-----';
+  assert.equal(cli(vault, ['save', '--title', 'Guard', '--tag=' + marker], { input: 'safe' }).failed.code, 'SECRET_DETECTED');
+  const original = save(vault, 'Intentional fixture', marker, '--allow-secrets');
+  const safe = succeeds(vault, ['update', original.id, '--expected-revision', original.revision, '--file', '-'], { input: 'Redacted' });
+  const args = [original.id, '--expected-revision', safe.revision, '--revision', original.revision];
+  assert.equal(cli(vault, ['restore', ...args]).failed.code, 'SECRET_DETECTED');
+  const client = await mcp(t, vault, 'codex');
+  const failed = await client.callTool({ name: 'oria_restore', arguments: {
+    id: original.id, expected_revision: safe.revision, revision: original.revision,
+  } });
+  assert.equal(failed.structuredContent.error.code, 'SECRET_DETECTED');
+  const list = await client.callTool({ name: 'oria_list', arguments: {} });
+  assert.ok(list.content.some(item => item.type === 'text' && item.text.includes('UNTRUSTED VAULT DATA')));
+  const updated = succeeds(vault, ['restore', ...args, '--allow-secrets']);
+  assert.equal(updated.id, original.id);
+  assert.equal(succeeds(vault, ['read', original.id]).body, marker);
+});
+
+test('import reports whether publication happened even when filesystem operations fail', t => {
+  const root = fixture(t);
+  const source = join(root, 'source');
+  const note = save(source, 'Import failure fixture', 'Persist me');
+  const backup = succeeds(source, ['export']).path;
+  const hook = join(root, 'import-fixture.mjs');
+  writeFileSync(hook, [
+    "import fs from 'node:fs';",
+    "import { dirname } from 'node:path';",
+    "import { syncBuiltinESMExports } from 'node:module';",
+    "const { renameSync, openSync, fsyncSync } = fs;",
+    "const target = process.env.ORIA_TEST_TARGET;",
+    "const issue = process.env.ORIA_TEST_FAULT;",
+    "const folders = new Set();",
+    "let published = false;",
+    "fs.renameSync = (src, dst) => {",
+    "  if (dst === target && issue === 'before') throw Object.assign(new Error('simulated rename failure'), {code:'EIO'});",
+    "  const result = renameSync(src, dst);",
+    "  if (dst === target) published = true;",
+    "  return result;",
+    "};",
+    "fs.openSync = (path, ...args) => {",
+    "  const fd = openSync(path, ...args);",
+    "  if (path === dirname(target) && published) folders.add(fd);",
+    "  return fd;",
+    "};",
+    "fs.fsyncSync = fd => {",
+    "  if (folders.has(fd)) throw Object.assign(new Error('simulated sync failure'), {code:'EIO'});",
+    "  return fsyncSync(fd);",
+    "};",
+    "syncBuiltinESMExports();",
+  ].join('\n'));
+  for (const fault of process.platform === 'win32' ? ['before'] : ['before', 'after']) {
+    const vault = join(root, fault);
+    mkdirSync(vault);
+    const target = join(realpathSync(vault), 'library');
+    const result = spawnSync(process.execPath, ['--import', pathToFileURL(hook).href, entrypoint, '--vault', vault,
+      '--json', 'import', backup], {
+      encoding: 'utf8', env: { ...process.env, ORIA_TEST_FAULT: fault, ORIA_TEST_TARGET: target },
+    });
+    if (fault === 'before') {
+      assert.equal(result.status, 1);
+      assert.equal(existsSync(target), false);
+      assert.equal(succeeds(vault, ['import', backup]).status, 'imported');
+    } else {
+      assert.equal(result.status, 0, result.stderr);
+      const status = JSON.parse(result.stdout);
+      assert.equal(status.status, 'imported');
+      assert.ok(status.durability_warning);
+      assert.equal(status.index_status, 'rebuild_on_search');
+      assert.equal(succeeds(vault, ['import', backup]).status, 'unchanged');
+    }
+    assert.equal(succeeds(vault, ['read', note.id]).body, 'Persist me');
+  }
+});
+
+test('successful replacement leaves one live link and accepts later editor or Finder actions', t => {
+  const root = fixture(t);
+  for (const operation of ['update', 'archive', 'restore']) {
+    for (const change of ['atomic save', 'move and rename', 'delete']) {
+      const vault = join(root, operation, change);
+      const note = save(vault, 'Sequential fixture', '可信 durable text');
+      let current = note;
+      if (operation === 'restore') {
+        current = succeeds(vault, ['update', note.id, '--expected-revision', note.revision, '--append-file', '-'],
+          { input: 'Restore fixture preimage' });
+      }
+      const args = [operation, note.id, '--expected-revision', current.revision];
+      if (operation === 'update') args.push('--append-file', '-');
+      if (operation === 'restore') args.push('--revision', note.revision);
+      succeeds(vault, args, { input: operation === 'update' ? 'Requested change' : '' });
+
+      const live = join(vault, note.path);
+      const active = join(vault, '.oria', 'replacement');
+      assert.equal(statSync(live).nlink, 1, operation + ' must not leave a hard link');
+      assert.ok(existsSync(join(active, 'published')));
+      assert.ok(!existsSync(join(active, 'next.md')));
+      assert.ok(existsSync(join(active, 'previous.md')));
+
+      if (change === 'atomic save') {
+        writeFileSync(live + '.editor', readFileSync(live, 'utf8') + '\n顺序 Editor save');
+        renameSync(live + '.editor', live);
+        assert.match(succeeds(vault, ['read', note.id]).body, /顺序 Editor save/);
+        assert.equal(succeeds(vault, ['search', '顺序 Editor'])[0].id, note.id);
+      } else if (change === 'move and rename') {
+        const folder = join(vault, 'library', 'Moved');
+        mkdirSync(folder);
+        renameSync(live, join(folder, '文档.md'));
+        rmdirSync(join(live, '..'));
+        assert.equal(succeeds(vault, ['search', '可信 durable'])[0].id, note.id);
+        assert.equal(succeeds(vault, ['read', note.id]).path, 'library/Moved/文档.md');
+      } else {
+        rmSync(live);
+        rmdirSync(join(live, '..'));
+        assert.equal(cli(vault, ['read', note.id]).failed.code, 'NOT_FOUND');
+        assert.equal(succeeds(vault, ['search', '可信 durable']).length, 0);
+        assert.equal(succeeds(vault, ['list']).total, 0);
+      }
+      assert.ok(succeeds(vault, ['export']).path);
+      assert.ok(!existsSync(join(vault, '.oria', 'recovered')), operation + ': ' + change);
+      assert.ok(!existsSync(active));
+    }
+  }
+});
+
+test('replacement settles interruptions before and after the durable publication marker', {
+  skip: process.platform === 'win32' ? 'process termination signal handling differs on Windows' : false,
+}, t => {
+  const root = fixture(t);
+  const hook = join(root, 'publication-fixture.mjs');
+  writeFileSync(hook, [
+    "import fs from 'node:fs';",
+    "import { basename, dirname } from 'node:path';",
+    "import { syncBuiltinESMExports } from 'node:module';",
+    "const { openSync, unlinkSync } = fs;",
+    "const phase = process.env.ORIA_PUBLICATION_TEST_PHASE;",
+    "const active = path => basename(dirname(path)) === 'replacement';",
+    "fs.openSync = (path, ...args) => {",
+    "  if (phase === 'before-marker' && typeof path === 'string' && basename(path) === 'published' && active(path) && args[0] === 'wx') process.kill(process.pid, 'SIGKILL');",
+    "  return openSync(path, ...args);",
+    "};",
+    "fs.unlinkSync = path => {",
+    "  if (basename(path) === 'next.md' && active(path) && fs.existsSync(dirname(path) + '/published')) {",
+    "    if (phase === 'after-marker') process.kill(process.pid, 'SIGKILL');",
+    "    if (phase === 'after-unlink') { unlinkSync(path); process.kill(process.pid, 'SIGKILL'); }",
+    "  }",
+    "  return unlinkSync(path);",
+    "};",
+    "syncBuiltinESMExports();",
+  ].join('\n'));
+
+  for (const phase of ['before-marker', 'after-marker', 'after-unlink']) {
+    const vault = join(root, phase);
+    const note = save(vault, 'Interrupted journal fixture', 'Original body');
+    const live = join(vault, note.path);
+    const result = spawnSync(process.execPath, ['--import', pathToFileURL(hook).href, entrypoint,
+      '--vault', vault, '--json', 'update', note.id, '--expected-revision', note.revision, '--append-file', '-'], {
+      input: 'Published body', encoding: 'utf8', env: { ...process.env, ORIA_PUBLICATION_TEST_PHASE: phase },
+    });
+    assert.equal(result.signal, 'SIGKILL', phase + ': ' + result.stderr);
+    assert.equal(statSync(live).nlink, phase === 'after-unlink' ? 1 : 2);
+    const active = join(vault, '.oria', 'replacement');
+    assert.equal(existsSync(join(active, 'published')), phase !== 'before-marker');
+    if (phase === 'after-marker') {
+      writeFileSync(live + '.editor', readFileSync(live, 'utf8') + '\nLater atomic save');
+      renameSync(live + '.editor', live);
+    }
+    const { body } = succeeds(vault, ['read', note.id]);
+    assert.equal(body, 'Original body\n\nPublished body' + (phase === 'after-marker' ? '\nLater atomic save' : ''));
+    assert.equal(statSync(live).nlink, 1);
+    assert.ok(!existsSync(active));
+    assert.ok(!existsSync(join(vault, '.oria', 'recovered')));
+    assert.ok(succeeds(vault, ['export']).path);
+  }
 });

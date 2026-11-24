@@ -22,14 +22,14 @@
 - **跨 Agent 共同维护同一份资产**：支持 **Claude Code**、**Codex**、**Antigravity** 通过统一 stdio MCP 接入，支持 **Grok Bot** 通过 macOS 本地命令执行接入（同时兼容 `oria mcp --agent grok-bot`），也可通过独立 CLI 在终端离线操作。
 - **可信来源追踪**：文件名前缀与 `created_by` / `updated_by` 支持 `claude-code`、`codex`、`antigravity`、`grok-bot`（未声明或未识别记 `unknown`）。MCP 接入由本地启动参数 `--agent` 注入，拒绝模型自报家门；Grok Bot 本地 CLI 接入通过 `--agent grok-bot`（或 `ORIA_AGENT=grok-bot`）标记来源。跨 Agent 更新时不改文件名、保留原始创建者并更新最后修改者。
 - **防误覆盖、防截断、防泄密**：
-  - 所有写入校验基于全文件 SHA-256 的 `expected_revision`，并由 SQLite 事务串行化，防止并发静默覆盖；
+  - 更新通过全文件 SHA-256 的 `expected_revision` 处理冲突。旧文件先进入恢复暂存，新文件以不覆盖现有文件的方式发布；
   - 支持 `append`（追加）与精确单处匹配的 `patch`（局部替换），正文被清空或大幅缩短时触发 `SHORTENING_PROTECTED`（仅 CLI 支持 `--allow-rewrite` 显式授权）；
   - 每次更新前自动保留原字节历史快照（`.oria-history/`），支持历史预览与安全恢复；
-  - 内置高置信度私钥与常见平台 Token 拦截（`SECRET_DETECTED`，仅 CLI 支持 `--allow-secrets` 显式放行）；
+  - 对正文、元数据和写入的历史内容检查常见敏感格式（`SECRET_DETECTED`，仅 CLI 支持 `--allow-secrets` 显式放行）；
   - MCP 读取与搜索结果附带不可信数据边界声明，降低知识库内容注入风险。
 - **中英混排本地全文搜索**：内置 SQLite FTS5 `trigram` + 短词字面匹配，支持英文、两字中文词与中英混排多词 AND 检索（如 `部署 rollback`）。
-- **容错与无 Daemon 设计**：无需常驻后台进程；每次操作按需对账磁盘，天然兼容人类手动编辑、重命名和移动文件；自动忽略 `.DS_Store`、`Icon\r`、`._*` 等系统元数据文件；单篇损坏的 YAML 或重复 ID 会隔离告警，不锁死其余健康笔记。
-- **可移植 ZIP 备份与校验恢复**：格式 2 备份包完整包含笔记、附件、空目录、历史原文与 SHA-256 清单；导入时严格防 ZIP Slip、符号链接、超限解压与目标数据误覆盖，并在恢复后立即重建索引。
+- **容错与无 Daemon 设计**：无需常驻后台进程；每次操作按需对账磁盘，天然兼容人类手动编辑、重命名和移动文件；单篇损坏的 YAML 或重复 ID 会隔离告警，不锁死其余健康笔记。
+- **可移植 ZIP 备份与校验恢复**：格式 2 备份包完整包含笔记、附件、空目录、历史原文与 SHA-256 清单；导入时严格防 ZIP Slip、符号链接、超限解压与目标数据误覆盖。导入结果独立于索引状态，搜索时自动重建索引。
 
 ---
 
@@ -134,7 +134,7 @@ cp -i skills/oria/SKILL.md "$HOME/.agents/skills/oria/"
 
 Grok Bot 的核心 Agent 运行在云端 Linux VM 中，无法直接连接本机的 `stdio` 或 `127.0.0.1` MCP，但它的 macOS 客户端（`Grok Bot.app`）支持在用户授权下直接在本机执行命令（**Settings → Computer → Your computer → Execution on this computer**）。ORIA 优先复用这一原生本地执行能力调用现有 CLI，**无需公网隧道、无需常驻桥接服务、不破坏 Local-first 架构**。
 
-1. 在 **Grok Bot.app** 中打开 **Settings → Computer → Your computer → Execution on this computer**，推荐保持 **Ask every time**（每次本地执行前由你确认；使用时需保持 Grok Bot.app 运行且 Mac 未锁屏）。
+1. 在 **Grok Bot.app** 中打开 **Settings → Computer → Your computer → Execution on this computer**，推荐保持 **Ask every time**（每次本地执行前由你确认）。这项权限可运行本机命令。确认具体命令、Vault 路径和待返回内容后再放行。绝对路径用于定位程序，CLI 的 `--agent` 是来源声明。Grok Bot 可以将命令输出用于云端会话。使用时需保持应用运行且 Mac 未锁屏。
 2. 在 Grok Bot 的 **Skills** 面板（或对话）中导入 [skills/oria-grok-bot/SKILL.md](skills/oria-grok-bot/SKILL.md) 作为私有 Skill，并将其中的 Node 24 与 ORIA 路径替换为你本机的绝对路径（防止非交互 Shell 找不到版本管理器安装的 Node）：
    ```sh
    # 在 ORIA 仓库根目录运行，获取需填入 Skill 的本地路径
@@ -197,7 +197,8 @@ oria --vault "$HOME/.oria/restored" search '可移植'
 ```
 
 - 默认导出至 `<vault>/.oria/backups/oria-*.zip`，并输出完整文件路径。
-- 导入仅面向空 Vault（相同快照支持幂等重复导入）；若目标已有不同数据，ORIA 会拒绝覆盖并保护现有文件。
+- 导入面向空 Vault，相同快照可重复导入。目标已有不同数据时返回冲突。便携文件按原字节保存，包括名字形似系统元数据的附件。若存在如 Finder `Icon\r`（真实名称含回车）的不可移植文件，导出会明确报错并保留原文件。
+- 导入结果的 `index_status: rebuild_on_search` 表示资产已发布或已匹配，下次搜索再检查和重建索引。损坏的 FTS 缓存可以重建，读笔记和备份无需 FTS。
 - 可以在 Markdown 中使用相对路径引用 `library/` 下的普通附件，备份会按原路径拼写与字节完整保留。
 - **注意**：导出 ZIP 包含完整性校验但不做自动加密，请勿将其直接当作加密容器公开分享。
 
@@ -215,7 +216,10 @@ oria --vault "$HOME/.oria/restored" search '可移植'
 │   ├── attachments/                # 附件目录（或放在任意笔记旁并用相对路径引用）
 │   └── .oria-history/              # 修改前的原字节历史快照（按 UUID / SHA-256 存放）
 └── .oria/                          # 本地可重建运行态（不作为真相源）
-    ├── state.sqlite                # SQLite FTS5 索引（删除后下次搜索自动重建）
+    ├── coordination.sqlite         # 同一 Vault 的 ORIA 进程之间协调
+    ├── state.sqlite                # 可重建的 SQLite FTS5 缓存
+    ├── replacement/                # 可恢复的当前替换记录（需要时存在）
+    ├── recovered/                  # 等待人工核对的冲突副本（需要时存在）
     ├── backups/                    # 默认导出 ZIP 目录
     └── staging/                    # 原子写入/导入暂存目录
 ```
@@ -224,11 +228,19 @@ oria --vault "$HOME/.oria/restored" search '可移植'
 
 ## 验证状态与已知边界
 
-- **自动化测试**：运行 `npm test` 执行 19 项端到端与回归测试（CLI、MCP、并发冲突、中文/Emoji 检索、单文件损坏隔离、系统元数据忽略、密钥拦截、ZIP 安全往返与索引重建，以及跨 Agent 读写更新）。
+- **自动化测试**：运行 `npm test` 执行端到端与回归测试（CLI、MCP、并发冲突、中文/Emoji 检索、单文件损坏隔离、文件备份完整性、密钥拦截、ZIP 安全往返与索引重建，以及跨 Agent 读写更新）。
 - **已真机初步实测（macOS arm64）**：Claude Code、Codex、Antigravity、Grok Bot（macOS 客户端本地命令执行接入）。
 - **待补充验证**：Linux / Windows 真机安装与跨平台 ZIP 往返，以及各宿主 Skill 的自然语言自动触发稳定度。
 - **V0.1 Alpha 容量上限**：10,000 个条目、单篇笔记 2 MiB、单文件 32 MiB、未压缩备份总容量 256 MiB（历史快照计入总容量）。
 - **明确不做（V0.1 边界）**：独立 GUI App、云端账号与多设备实时同步、向量 Embedding / RAG、BYOK 问答、静默录制全量聊天记录。
+
+### 从 Alpha.1 升级与核对恢复副本
+
+升级前关闭连接同一 Vault 的旧版 CLI/MCP 进程，再统一启用新版。Markdown、UUID、历史目录与 ZIP 格式保持兼容。请在 ORIA 写入前让外部编辑器保存并关闭正在编辑的同一文件。
+
+操作成功后，正文不保留暂存硬链接，可以照常在外部编辑器保存，或在文件管理器移动、改名和删除。若检测到旧文件被继续写入，则保留冲突副本。
+
+如果收到 `RECOVERY_PENDING`，先检查错误中指向的 `.oria/recovered/` 或 `.oria/replacement/`。请先复制并比较留存原文与 `library/` 里的当前原文，把需要的内容合并或移至安全目录；处理完后再试导出。待核对的副本会阻止导出，以免漏备。保留先前文件句柄的外部编辑器如果迟至下一次 ORIA 操作之后才写入，仍无法保证其改动被捕获。
 
 ## 反馈与参与 Alpha 测试
 

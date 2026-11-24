@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { unlinkSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   type Agent, type ArchiveInput, type Metadata, type Note, type RestoreInput, type SaveInput, type UpdateInput,
@@ -6,8 +8,9 @@ import {
   parseNote, projectId, protectBody, protectSecrets, readSchema, restoreSchema, reviseBody, safeProjectHint,
   saveSchema, searchSchema, updateSchema, validate,
 } from './domain.js';
-import { type TreeEntry, VaultPaths, portableKey, readChecked, validatePath, walkTree } from './filesystem.js';
+import { type TreeEntry, VaultPaths, checkFile, flushDirectory, portableKey, readChecked, validatePath, walkTree } from './filesystem.js';
 import { historyEntries, historyPath, isHistoryPath, readHistory } from './history.js';
+import { publishNote, settleReplacement } from './replacement.js';
 
 // isolate invalid or duplicated ORIA notes during normal vault
 // reads/writes instead of bricking healthy notes, while keeping strict loadNotes for backups.
@@ -184,33 +187,55 @@ export class Vault {
     this.paths = new VaultPaths(path);
   }
 
-  transaction<T>(operation: (db: DatabaseSync) => T): T {
-    const db = new DatabaseSync(this.paths.database(), { timeout: 8000 });
+  transaction<T>(operation: () => T): T {
+    const db = new DatabaseSync(this.paths.database('coordination'), { timeout: 8000 });
     try {
       db.exec('BEGIN IMMEDIATE');
-      const result = operation(db);
+      settleReplacement(this.paths);
+      const result = operation();
       db.exec('COMMIT');
       return result;
     } finally {
-      db.close(); // Rolls back any active transaction when an operation fails.
+      db.close();
     }
   }
 
   init() {
-    this.transaction(db => this.ensureIndex(db));
+    this.transaction(() => undefined);
     return { vault: this.paths.root };
   }
 
-  // allow importVault to eagerly rebuild the FTS5 index inside its transaction.
-  rebuildIndex(db: DatabaseSync): void {
-    const { notes } = scanNotes(walkTree(this.paths.library), undefined, false);
-    this.refreshIndex(db, notes);
+  private withIndex<T>(operation: (db: DatabaseSync) => T): T {
+    const path = this.paths.database('state');
+    const query = () => {
+      const db = new DatabaseSync(path);
+      try {
+        db.exec('BEGIN IMMEDIATE');
+        const result = operation(db);
+        db.exec('COMMIT');
+        return result;
+      } finally {
+        db.close();
+      }
+    };
+    try {
+      return query();
+    } catch (error) {
+      const sqlite = error as Error & { errcode?: number; code?: string };
+      const code = (sqlite.errcode ?? 0) & 0xff;
+      const brokenSchema = code === 1 && /no such (?:column|table)|unable to use function bm25/.test(sqlite.message);
+      if (sqlite.code !== 'ERR_SQLITE_ERROR' || (!brokenSchema && code !== 11 && code !== 26)) throw error;
+      // Coordination is independent of these disposable index files.
+      for (const suffix of ['', '-journal', '-wal', '-shm']) {
+        if (checkFile(path + suffix)) unlinkSync(path + suffix);
+      }
+      flushDirectory(dirname(path));
+      return query();
+    }
   }
 
   save(input: SaveInput, workspaceProject?: string, options: { allowSecrets?: boolean } = {}) {
     const values = validate(saveSchema, input, 'save');
-    // guard against saving high-confidence secrets/private keys into plaintext notes.
-    protectSecrets([values.title, values.body, values.source_reference], options.allowSecrets);
     // strict validation for explicit project, safe fallback for untrusted project_hint.
     const project = values.project !== undefined
       ? projectId(values.project)
@@ -253,9 +278,10 @@ export class Vault {
       const directory = projectEntry?.relativePath ?? projectPath;
       const relativePath = directory + '/' + noteFilename(metadata);
       const bytes = encodeNote(metadata, values.body);
+      protectSecrets([bytes.toString('utf8')], options.allowSecrets);
       checkWriteCapacity(entries, [{ path: relativePath, size: bytes.length }]);
       const written = parseNote(relativePath, bytes)!;
-      this.paths.putNote(relativePath, bytes);
+      publishNote(this.paths, relativePath, bytes);
       return {
         created: true,
         document: summary(written),
@@ -299,13 +325,12 @@ export class Vault {
       if (clear_source_reference || source_reference === null) delete metadata.source_reference;
       else if (source_reference !== undefined) metadata.source_reference = source_reference;
       const nextBody = reviseBody(note.body, values);
-      protectSecrets([title, nextBody, source_reference ?? undefined], options.allowSecrets);
       protectBody(note.body, nextBody, options.allowRewrite);
-      return this.replace(tree, note, metadata, nextBody);
+      return this.replace(tree, note, metadata, nextBody, note, options.allowSecrets);
     });
   }
 
-  archive(input: ArchiveInput) {
+  archive(input: ArchiveInput, options: { allowSecrets?: boolean } = {}) {
     const values = validate(archiveSchema, input, 'archive');
     const expected = expectedRevision(values);
     return this.transaction(() => {
@@ -315,7 +340,7 @@ export class Vault {
       if (note.metadata.archived_at) return summary(note);
       return this.replace(tree, note, {
         ...note.metadata, archived_at: nextTimestamp(note.metadata.updated_at),
-      }, note.body);
+      }, note.body, note, options.allowSecrets);
     });
   }
 
@@ -339,7 +364,7 @@ export class Vault {
     });
   }
 
-  restore(input: RestoreInput, options: { allowRewrite?: boolean } = {}) {
+  restore(input: RestoreInput, options: { allowRewrite?: boolean; allowSecrets?: boolean } = {}) {
     const { id, revision, ...expectation } = validate(restoreSchema, input, 'restore');
     const expected = expectedRevision(expectation);
     return this.transaction(() => {
@@ -350,7 +375,7 @@ export class Vault {
       const snapshot = this.snapshot(tree, id, revision);
       protectBody(note.body, snapshot.body, options.allowRewrite);
       const { created_at, created_by } = note.metadata;
-      return this.replace(tree, note, { ...snapshot.metadata, created_at, created_by }, snapshot.body, snapshot);
+      return this.replace(tree, note, { ...snapshot.metadata, created_at, created_by }, snapshot.body, snapshot, options.allowSecrets);
     });
   }
 
@@ -360,10 +385,11 @@ export class Vault {
     return readHistory(previous);
   }
 
-  private replace(tree: TreeEntry[], note: Note, metadata: Metadata, body: string, template = note) {
+  private replace(tree: TreeEntry[], note: Note, metadata: Metadata, body: string, template: Note, allowSecrets?: boolean) {
     metadata.updated_at = nextTimestamp(note.metadata.updated_at);
     metadata.updated_by = this.agent;
     const bytes = encodeNote(metadata, body, template);
+    protectSecrets([bytes.toString('utf8')], allowSecrets);
     const snapshotPath = historyPath(note.metadata.id, note.version);
     const previous = historyEntries(tree).get(snapshotPath);
     if (previous) readHistory(previous);
@@ -371,17 +397,14 @@ export class Vault {
       { path: note.relativePath, size: bytes.length }, { path: snapshotPath, size: note.size },
     ]);
     const written = parseNote(note.relativePath, bytes)!;
-    const readUnchanged = () => {
-      const current = readChecked(this.paths.pathInLibrary(note.relativePath), limits.note);
-      if (digest(current) !== note.version) {
-        throw new OriaError('VERSION_CONFLICT', 'Document changed while writing. Read it again before retrying.');
+    if (!previous) {
+      const original = readChecked(this.paths.pathInLibrary(note.relativePath), limits.note);
+      if (digest(original) !== note.version) {
+        throw new OriaError('VERSION_CONFLICT', 'Document changed before its history could be saved.');
       }
-      return current;
-    };
-    this.paths.putNote(note.relativePath, bytes, () => {
-      if (!previous) this.paths.putNote(snapshotPath, readUnchanged());
-      readUnchanged();
-    });
+      publishNote(this.paths, snapshotPath, original);
+    }
+    publishNote(this.paths, note.relativePath, bytes, note.version);
     return summary(written);
   }
 
@@ -413,7 +436,7 @@ export class Vault {
     const terms = [...new Set(folded(query).split(/\s+/u))];
     const longTerms = terms.filter(term => Array.from(term).length >= 3);
     const shortTerms = terms.filter(term => Array.from(term).length < 3);
-    return this.transaction(db => {
+    return this.transaction(() => this.withIndex(db => {
       const loaded = scanNotes(walkTree(this.paths.library), undefined, false);
       const { notes } = loaded;
       this.refreshIndex(db, notes);
@@ -430,7 +453,7 @@ export class Vault {
         if (results.length === limit) break;
       }
       return results;
-    });
+    }));
   }
 
   private ensureIndex(db: DatabaseSync): void {

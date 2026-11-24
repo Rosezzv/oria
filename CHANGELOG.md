@@ -2,6 +2,14 @@
 
 All notable public releases of ORIA are documented in this file.
 
+## [v0.1.0-alpha.2] - Reliability & Data Safety Update
+
+- Preserve all portable files in backups, including metadata-like filenames. Refuse nonportable paths and nonempty destinations rather than silently omitting or removing files.
+- Stage the existing directory entry and publish note replacements without overwriting external edits at the live path. Retain recoverable files on conflicts and resume interrupted replacements. Remove the staging link before success so subsequent editor saves, moves, renames, and deletions work normally.
+- Decouple Markdown and import results from FTS. Recognized index corruption is repaired on search.
+- Apply the secret guard to written metadata and restored content. Add consistent MCP data framing, safer installer quoting, and bilingual recovery instructions.
+- Keep Markdown and ZIP formats compatible. Restart every client sharing a Vault when upgrading from Alpha.1.
+
 ## [v0.1.0-alpha.1] - 2026-11-24
 
 Initial public Alpha release of ORIA — **Your AI changes. Your knowledge stays.**

@@ -1,6 +1,6 @@
 {
   "name": "oria-local",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Local-first Markdown knowledge across agents",
   "license": "MIT",
   "type": "module",
@@ -15,6 +15,7 @@
     "skills",
     "scripts/install.sh",
     "README.md",
+    "README.en.md",
     "ARCHITECTURE.md",
     "CHANGELOG.md",
     "LICENSE"

@@ -23,14 +23,14 @@ If you move between **Claude Code**, **Codex**, **Antigravity**, and **Grok Bot*
 - **One Vault Across Multiple Agents**: Connect **Claude Code**, **Codex**, and **Antigravity** via a unified stdio MCP server, connect **Grok Bot** via macOS local command execution (`oria mcp --agent grok-bot` is also supported for local stdio MCP clients), or operate directly from the standalone CLI.
 - **Trusted Provenance**: Filenames and `created_by` / `updated_by` metadata track `claude-code`, `codex`, `antigravity`, and `grok-bot` (falling back to `unknown` when undeclared or unrecognized). For MCP hosts, agent identity is injected by the local server launch config (`--agent`) and cannot be overridden by model arguments; for Grok Bot local CLI execution, identity is declared via `--agent grok-bot` (or `ORIA_AGENT=grok-bot`). Cross-agent updates preserve the original filename and `created_by` while updating `updated_by`.
 - **Built-in Safeguards Against Data Loss & Leaks**:
-  - Every write verifies `expected_revision` (full-file SHA-256) inside serialized SQLite transactions to prevent silent concurrent overwrites.
+  - Updates verify `expected_revision` (full-file SHA-256). The old file moves into recoverable staging, then the new revision is published without clobbering an existing entry.
   - Supports `append` and exact single-match `patch` edits, with shortening protection (`SHORTENING_PROTECTED`) that blocks accidental full-body truncation (intentional rewrites require explicit `--allow-rewrite` in the CLI).
   - Automatically saves byte-exact pre-write snapshots under `.oria-history/` for preview and restore.
-  - Blocks high-confidence private keys and common API tokens (`SECRET_DETECTED`; explicit `--allow-secrets` override is CLI-only).
+  - Checks for common high-confidence secret patterns in written bodies, metadata, and restored content (`SECRET_DETECTED`; explicit `--allow-secrets` override is CLI-only).
   - Wraps MCP read and search responses with explicit untrusted-data framing to reduce prompt-injection risk from stored notes.
 - **Multilingual Offline Full-Text Search**: Powered by Node.js built-in SQLite FTS5 (`trigram`) combined with short-term literal matching. Supports English, two-character Chinese terms, and mixed Chinese/English multi-term AND queries (e.g. `部署 rollback`).
-- **Daemon-Free & Fault-Tolerant**: No background file-watcher daemon. Each operation reconciles directly against disk, cleanly picking up manual edits, renames, and moves. Automatically ignores OS metadata junk (`.DS_Store`, `Icon\r`, `._*`, `Thumbs.db`, `Desktop.ini`). A single manually broken YAML file or Finder duplicate raises an isolated warning in `list` instead of locking out healthy notes.
-- **Portable ZIP Backup & Verified Restore**: Format-2 backups bundle notes, attachments, empty directories, history snapshots, and a SHA-256 manifest. Imports validate against ZIP Slip, symlinks, checksum mismatches, size bombs, and accidental overwrites, then rebuild the search index automatically.
+- **Daemon-Free & Fault-Tolerant**: No background file-watcher daemon. Each operation reconciles directly against disk, cleanly picking up manual edits, renames, and moves. A single damaged YAML file or duplicate ID raises an isolated warning in `list`.
+- **Portable ZIP Backup & Verified Restore**: Format-2 backups bundle notes, attachments, empty directories, history snapshots, and a SHA-256 manifest. Imports validate against ZIP Slip, symlinks, checksum mismatches, size bombs, and accidental overwrites, then reconcile the search index on the next search.
 
 ---
 
@@ -135,7 +135,7 @@ Then refresh MCP servers under **Skills & Customizations** (or **`...` > MCP Ser
 
 Grok Bot executes its primary session in a cloud Linux VM and cannot attach directly to a local `stdio` or `127.0.0.1` MCP server. Instead, ORIA reuses the built-in local command execution in `Grok Bot.app` (**Settings → Computer → Your computer → Execution on this computer**) to invoke the existing local CLI — **no public tunnel, no remote bridge daemon, and no compromise to local-first security**.
 
-1. In **Grok Bot.app**, open **Settings → Computer → Your computer → Execution on this computer** and keep **Ask every time** enabled (recommended; requires `Grok Bot.app` to stay open with your Mac unlocked while running local commands).
+1. In **Grok Bot.app**, open **Settings → Computer → Your computer → Execution on this computer** and keep **Ask every time** enabled (recommended). Review the command, Vault path, and data before approving. Local execution grants command access to your machine. Absolute paths identify the program and `--agent` declares provenance. Output may be used by the cloud session. Keep the app open and your Mac unlocked while running commands.
 2. Import [skills/oria-grok-bot/SKILL.md](skills/oria-grok-bot/SKILL.md) as a private Skill in Grok Bot and fill in your local absolute paths so non-interactive shells locate Node 24 cleanly:
    ```sh
    # Run from the ORIA repository root to print your local paths
@@ -216,7 +216,10 @@ oria --vault "$HOME/.oria/restored" search 'portable'
 │   ├── attachments/                # Attachments (or place next to notes with relative links)
 │   └── .oria-history/              # Byte-exact pre-write snapshots (by UUID / SHA-256)
 └── .oria/                          # Rebuildable local runtime state (never Source of Truth)
-    ├── state.sqlite                # SQLite FTS5 index (delete anytime; rebuilt on next search)
+    ├── coordination.sqlite         # Coordinates ORIA processes sharing a Vault
+    ├── state.sqlite                # Rebuildable SQLite FTS5 cache
+    ├── replacement/                # Current replacement journal, when present
+    ├── recovered/                  # Conflict copies for review, when present
     ├── backups/                    # Default ZIP export directory
     └── staging/                    # Atomic write/import staging directory
 ```
@@ -225,13 +228,23 @@ oria --vault "$HOME/.oria/restored" search 'portable'
 
 ## Validation Status & Known Limitations
 
-- **Automated Test Suite**: `npm test` runs 19 end-to-end and regression tests covering CLI, MCP, concurrent revision conflicts, Chinese/mixed/emoji search, single-file fault isolation, OS metadata filtering, secret detection, ZIP safety & index rebuild, and cross-agent workflows.
+- **Automated Test Suite**: `npm test` runs end-to-end and regression tests covering CLI, MCP, concurrent revision conflicts, Chinese/mixed/emoji search, single-file fault isolation, backup completeness, secret detection, ZIP safety & index rebuild, and cross-agent workflows.
 - **Verified on Real Hardware (macOS arm64)**: Initial real-world verification completed with **Claude Code**, **Codex**, **Antigravity**, and **Grok Bot** (macOS local command execution).
 - **Not Yet Verified on Real Hardware**: Linux and Windows installation, cross-OS ZIP round-trips, and consistent automatic Skill triggering ("proactively offering to save") across agent harnesses.
 - **V0.1 Alpha Limits**: 10,000 entries, 2 MiB per note, 32 MiB per file, and 256 MiB uncompressed backup total (history snapshots count toward total capacity).
 - **Explicit V0.1 Non-Goals**: Standalone desktop/web UI, cloud accounts or multi-device sync, vector embeddings / RAG, BYOK Q&A, and silent full-conversation capture.
 
 ---
+
+### Upgrading from Alpha.1 and reviewing recovery copies
+
+Stop older CLI/MCP processes sharing the Vault before starting the new version. Markdown, UUIDs, history paths, and ZIP formats remain compatible. Save and close the same file in any external editor before an ORIA write.
+
+Backups preserve portable files byte for byte, including attachments whose names resemble OS metadata. A nonportable name such as Finder's `Icon\r` (with a literal carriage return) blocks export and the original stays intact. Import is for empty Vaults, and re-importing an identical snapshot is safe. `index_status: rebuild_on_search` confirms the assets have been published or already matched. The next search reconciles the index. Reading and backup work independently of the FTS cache.
+
+A successful operation leaves no staging link to the live note. You can then save it in an external editor or move, rename, or delete it in your file manager. ORIA preserves a recovery copy if it detects that an editor kept writing to the old file.
+
+On `RECOVERY_PENDING`, inspect the indicated `.oria/recovered/` or `.oria/replacement/` directory. Copy and compare the preserved version with the live file in `library/`, then merge or move the files to a safe location before retrying export. Pending copies block export to avoid omitting data. ORIA may miss writes through an old open file descriptor after the next ORIA operation.
 
 ## Alpha Testing & Feedback
 

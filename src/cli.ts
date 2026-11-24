@@ -16,9 +16,9 @@ const help = [
   '            [--title TITLE] [--project NAME] [--type TYPE] [--tag TAG ...|--clear-tags]',
   '            [--source REF|--clear-source] [--allow-rewrite] [--allow-secrets]',
   'oria history ID [--limit N]',
-  'oria restore ID --revision HASH --expected-revision HASH [--allow-rewrite]',
+  'oria restore ID --revision HASH --expected-revision HASH [--allow-rewrite] [--allow-secrets]',
   'oria list [--project NAME] [--limit N]',
-  'oria archive ID --expected-revision HASH',
+  'oria archive ID --expected-revision HASH [--allow-secrets]',
   'oria export',
   'oria import BACKUP.zip',
   'oria mcp [--agent claude-code|codex|antigravity|grok-bot]',
@@ -61,9 +61,9 @@ const commandOptions: Record<string, string[]> = {
   update: ['version', 'expected-revision', 'allow-rewrite', 'allow-secrets', 'title', 'project', 'type', 'tag', 'source',
     'file', 'append-file', 'patch-file', 'clear-tags', 'clear-source'],
   list: ['project', 'limit'],
-  archive: ['version', 'expected-revision'],
+  archive: ['version', 'expected-revision', 'allow-secrets'],
   history: ['limit'],
-  restore: ['revision', 'version', 'expected-revision', 'allow-rewrite'],
+  restore: ['revision', 'version', 'expected-revision', 'allow-rewrite', 'allow-secrets'],
   export: [],
   import: [],
   mcp: [],
@@ -209,7 +209,7 @@ async function main(args: string[]) {
       break;
     }
     case 'archive': {
-      const result = vault.archive({ id: argument!, ...expectation });
+      const result = vault.archive({ id: argument!, ...expectation }, writeOptions);
       output(result, 'Archived ' + documentLine(result) + '\nRevision: ' + result.revision);
       break;
     }
@@ -234,7 +234,9 @@ async function main(args: string[]) {
     }
     case 'import': {
       const result = await importVault(vault, argument!);
-      output(result, result.status === 'imported' ? 'Restored ' + result.entries + ' entries.' : 'Vault already matches the backup.');
+      const status = result.status === 'imported' ? 'Restored ' + result.entries + ' entries.' : 'Vault already matches the backup.';
+      output(result, status + ' Search index will reconcile on the next search.' +
+        (result.durability_warning ? '\nWarning: ' + result.durability_warning : ''));
       break;
     }
   }

@@ -1,6 +1,6 @@
 import {
   closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync,
-  openSync, readdirSync, readSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
+  openSync, readdirSync, readSync, realpathSync, statSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, parse } from 'node:path';
@@ -8,24 +8,6 @@ import { isDeviceName, limits, manifestName, OriaError } from './domain.js';
 
 export function portableKey(relativePath: string): string {
   return relativePath.normalize('NFC').toUpperCase().normalize('NFC');
-}
-
-// ignore OS directory metadata files created automatically by Finder/Explorer.
-export function isOsMetadata(name: string): boolean {
-  const upper = name.normalize('NFC').toUpperCase();
-  return upper === '.DS_STORE' || upper === 'THUMBS.DB' || upper === 'DESKTOP.INI' ||
-    name === 'Icon\r' || name.startsWith('._');
-}
-
-export function cleanOsMetadata(directory: string): void {
-  if (!checkDirectory(directory)) return;
-  for (const name of readdirSync(directory)) {
-    const absolutePath = join(directory, name);
-    const info = stat(absolutePath);
-    if (info && !info.isSymbolicLink() && info.isFile() && info.nlink === 1 && isOsMetadata(name)) {
-      unlinkSync(absolutePath);
-    }
-  }
 }
 
 export function validatePath(relativePath: string): void {
@@ -93,7 +75,7 @@ export interface TreeEntry {
   size: number;
 }
 
-export function walkTree(root: string): TreeEntry[] {
+export function walkTree(root: string, options: { forBackup?: boolean } = {}): TreeEntry[] {
   const entries: TreeEntry[] = [];
   const seen = new Set<string>();
   if (!checkDirectory(root)) return entries;
@@ -106,8 +88,9 @@ export function walkTree(root: string): TreeEntry[] {
       if (!info || info.isSymbolicLink() || !(info.isDirectory() || (info.isFile() && info.nlink === 1))) {
         throw new OriaError('UNSAFE_PATH', 'Unexpected file type at ' + relativePath);
       }
-      // skip regular OS metadata files only after lstat confirms they are not links.
-      if (info.isFile() && isOsMetadata(name)) continue;
+      // A Finder icon has a non-portable name. Only ordinary note scans skip it.
+      // Backups must report it rather than claiming to include all library files.
+      if (!options.forBackup && info.isFile() && name === 'Icon\r') continue;
       validatePath(relativePath);
       const key = portableKey(relativePath);
       if (seen.has(key)) throw new OriaError('UNSAFE_PATH', 'Path collision at ' + relativePath);
@@ -207,18 +190,20 @@ export class VaultPaths {
     }
   }
 
-  internalDirectory(name: 'backups' | 'staging'): string {
+  internalPath(name: string): string {
     this.verifyRoot();
     ensureDirectory(this.internal);
-    const path = join(this.internal, name);
+    return join(this.internal, name);
+  }
+
+  internalDirectory(name: 'backups' | 'staging' | 'recovered'): string {
+    const path = this.internalPath(name);
     ensureDirectory(path);
     return path;
   }
 
-  database(): string {
-    this.verifyRoot();
-    ensureDirectory(this.internal);
-    const path = join(this.internal, 'state.sqlite');
+  database(name: 'state' | 'coordination'): string {
+    const path = this.internalPath(name + '.sqlite');
     for (const suffix of ['', '-journal', '-wal', '-shm']) checkFile(path + suffix);
     return path;
   }
@@ -240,21 +225,4 @@ export class VaultPaths {
     return mkdtempSync(join(this.internalDirectory('staging'), 'oria-'));
   }
 
-  putNote(relativePath: string, bytes: Buffer, expectedVersion?: () => void): void {
-    const stage = this.stage();
-    try {
-      const staged = join(stage, 'note.md');
-      writeNewFile(staged, bytes);
-      const target = this.pathInLibrary(relativePath, !expectedVersion);
-      if (expectedVersion) {
-        expectedVersion();
-      } else if (stat(target)) {
-        throw new OriaError('CONFLICT', 'Document path already exists');
-      }
-      renameSync(staged, target);
-      flushDirectory(dirname(target));
-    } finally {
-      rmSync(stage, { recursive: true, force: true });
-    }
-  }
 }

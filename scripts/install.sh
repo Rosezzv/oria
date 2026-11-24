@@ -26,6 +26,8 @@ if [ "$NODE_MAJOR" -lt 24 ]; then
   exit 1
 fi
 
+VAULT_DIR="$("$NODE_BIN" -p 'require("node:path").resolve(process.argv[1])' -- "$VAULT_DIR")"
+
 echo "[1/3] Installing dependencies and building ORIA ($NODE_VER)..."
 cd "$ROOT_DIR"
 npm ci
@@ -42,29 +44,28 @@ echo ""
 echo "Vault location: $VAULT_DIR"
 echo "Markdown notes: $VAULT_DIR/library/projects/"
 echo ""
-echo "--- Copy-paste setup for your AI Agents ---"
-echo ""
-echo "1) Claude Code:"
-echo "   claude mcp add --transport stdio --scope user oria -- \"$NODE_BIN\" \"$CLI_PATH\" mcp --agent claude-code --vault \"$VAULT_DIR\""
-echo "   mkdir -p \"\$HOME/.claude/skills/oria\" && cp -i \"$ROOT_DIR/skills/oria/SKILL.md\" \"\$HOME/.claude/skills/oria/\""
-echo ""
-echo "2) Codex:"
-echo "   codex mcp add oria -- \"$NODE_BIN\" \"$CLI_PATH\" mcp --agent codex --vault \"$VAULT_DIR\""
-echo "   mkdir -p \"\$HOME/.agents/skills/oria\" && cp -i \"$ROOT_DIR/skills/oria/SKILL.md\" \"\$HOME/.agents/skills/oria/\""
-echo ""
-echo "3) Antigravity (~/.gemini/config/mcp_config.json):"
-cat <<EOF
-   {
-     "mcpServers": {
-       "oria": {
-         "command": "$NODE_BIN",
-         "args": ["$CLI_PATH", "mcp", "--agent", "antigravity", "--vault", "$VAULT_DIR"]
-       }
-     }
-   }
-EOF
-echo "   mkdir -p \"\$HOME/.gemini/config/skills/oria\" && cp -i \"$ROOT_DIR/skills/oria/SKILL.md\" \"\$HOME/.gemini/config/skills/oria/\""
-echo ""
+echo "--- Copy-paste setup for Bash or Zsh ---"
+"$NODE_BIN" - "$NODE_BIN" "$CLI_PATH" "$VAULT_DIR" "$ROOT_DIR" <<'NODE'
+const [node, cli, vault, root] = process.argv.slice(2);
+const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
+const command = agent => [node, cli, 'mcp', '--agent', agent, '--vault', vault].map(quote).join(' ');
+const skill = quote(root + '/skills/oria/SKILL.md');
+function printSkill(directory) {
+  console.log('   mkdir -p "$HOME/' + directory + '" && cp -i ' + skill + ' "$HOME/' + directory + '/"');
+}
+console.log('\n1) Claude Code:');
+console.log('   claude mcp add --transport stdio --scope user oria -- ' + command('claude-code'));
+printSkill('.claude/skills/oria');
+console.log('\n2) Codex:');
+console.log('   codex mcp add oria -- ' + command('codex'));
+printSkill('.agents/skills/oria');
+console.log('\n3) Antigravity (~/.gemini/config/mcp_config.json):');
+console.log(JSON.stringify({ mcpServers: { oria: {
+  command: node, args: [cli, 'mcp', '--agent', 'antigravity', '--vault', vault],
+} } }, null, 2));
+printSkill('.gemini/config/skills/oria');
+console.log();
+NODE
 echo "4) Grok Bot (macOS local execution):"
 echo "   Import $ROOT_DIR/skills/oria-grok-bot/SKILL.md as a private Skill and set:"
 echo "   NODE:  $NODE_BIN"

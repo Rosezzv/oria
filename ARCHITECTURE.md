@@ -21,17 +21,17 @@ CLI 和 stdio MCP 使用同一个 Knowledge Core。Agent Skill 负责解释何�
 
 ## 查询与版本控制
 
-- 每次操作按需扫描磁盘，通过文件内容 SHA-256 识别更新，兼容修改、移动、重命名和删除。系统目录元数据文件（`.DS_Store`、`Icon\r`、`._*`、`Thumbs.db`、`Desktop.ini`）在通过 `lstat` 非链接检查后自动忽略。日常读/搜/列/写遇到无关单篇损坏 YAML 或重复 ID 时会隔离告警而不锁死健康笔记，`export`/`import` 保持全库严格校验。FTS5 trigram 对 NFC 规范化的标题、正文和标签建立索引；空格分隔的词按 AND 查询，长度小于三个 Unicode 字符的词以字面子串匹配，摘要按 Unicode 码点切片避免截断代理项。停掉所有 ORIA 进程后可移走 `.oria/state.sqlite`，下次查询重建索引。
+- 每次操作按需扫描磁盘，通过文件内容 SHA-256 识别更新，兼容修改、移动、重命名和删除。系统文件名不参与备份过滤。日常笔记扫描只跳过通过文件类型检查的非便携 Finder 图标文件。日常读/搜/列/写遇到无关单篇损坏 YAML 或重复 ID 时会隔离告警而不锁死健康笔记，`export`/`import` 保持全库严格校验。FTS5 trigram 对 NFC 规范化的标题、正文和标签建立索引；空格分隔的词按 AND 查询，长度小于三个 Unicode 字符的词以字面子串匹配，摘要按 Unicode 码点切片避免截断代理项。FTS 使用 `.oria/state.sqlite`，读笔记、备份和导入无需打开它。搜索发现损坏数据库或不兼容索引 schema 时重建。`.oria/coordination.sqlite` 用于跨进程锁。升级时停止使用该 Vault 的所有旧版 ORIA 进程。
 - `revision` 是完整 Markdown 字节的 SHA-256，涵盖 frontmatter 和正文。更新、归档与恢复均在 Core 校验 `expected_revision`。旧参数 `version`（CLI 的 `--version`）作为兼容别名。追加保留原正文，按需添加一个段落间隔。局部替换要求原文精确匹配一次。MCP 通过 `clear_source_reference: true` 清除来源，避免在工具 Schema 中暴露不兼容正则或 `anyOf: [string, null]`。
-- 非空正文被清空，或者正文少掉至少 100 个非空白 Unicode 字符且剩余不足 70% 时，Core 报 `SHORTENING_PROTECTED`；检测到高置信度私钥或常见平台 Token 时，Core 报 `SECRET_DETECTED`。CLI 的 `--allow-rewrite` 与 `--allow-secrets` 仅由用户在终端显式授权，MCP schema 不暴露这两个开关。MCP 的 `oria_read` 与 `oria_search` 附带不可信数据边界提示。所有写入仍须校验当前 Hash。
-- SQLite 写事务串行化同一 vault 的 ORIA 写入。Core 发布新正文前，会原样保存旧文件到 `.oria-history/<UUID>/<SHA-256>.md` 并再次核对当前文件。历史保留原字节，现有版本可以单独预览。恢复将选中快照的正文和元数据写成新版本，保留当前笔记的 ID、创建归属及路径，并记录本次操作者。历史不自动淘汰。超过备份容量时，新写入会被拒绝。
-- 手动编辑会改变 Hash，并在下一次 ORIA 操作时生效。ORIA 保存下一次写入看到的前序字节。外部编辑器不参与 SQLite 锁，在最后一次校验与原子替换之间并发写入的极短窗口内，检测存在限制。恢复针对仍存在的笔记，若用户已手动删除当前文件，仍可读出任何已存历史。
+- 非空正文被清空，或者正文少掉至少 100 个非空白 Unicode 字符且剩余不足 70% 时，Core 报 `SHORTENING_PROTECTED`；检测到高置信度私钥或常见平台 Token 时，Core 报 `SECRET_DETECTED`。CLI 的 `--allow-rewrite` 与 `--allow-secrets` 仅由用户在终端显式授权，MCP schema 不暴露这两个开关。MCP 工具返回的文本附带不可信数据边界提示。保存、更新、归档和恢复扫描即将写入的完整文档。已有历史和 ZIP 保留原字节。所有写入仍须校验当前 Hash。
+- Core 先保存旧文件原文至 `.oria-history/<UUID>/<SHA-256>.md`。随后把磁盘上的旧目录条目移到持久暂存位置，对实际移走的文件重新校验 Hash，再通过独占硬链接发布新文件。要求同一个支持硬链接的本地文件系统。若外部程序占据目标名，其文件与旧副本都会被保留。先使发布标记持久化，再清理新正文的暂存硬链接。中断且无发布标记时，以实际文件身份判断是否已经发布。发布标记存在后，后续编辑、移动或删除不触发冲突，复核仅针对旧文件句柄。
+- 下一次 ORIA 操作会检查外部程序是否通过旧文件句柄继续写入。发现差异时保留到 `.oria/recovered/` 并告警，导出在处理前返回 `RECOVERY_PENDING`。旧句柄迟于下一次操作的写入仍有风险，同一正文应避免并行编辑。两次目录操作之间存在可恢复的路径缺席窗口。UUID、原路径、创建归属与历史格式保持不变。手动删除当前文件后，已有历史仍可读取。
 
 ORIA 笔记由 UTF-8 Markdown 和 YAML frontmatter 组成。当前格式为 `oria_format: 1`，包含 `id`、`title`、`project`、`type`、`created_at`、`updated_at`、`created_by`、`updated_by` 和 `tags`。可选字段包括来源 `source_reference` 和归档时间 `archived_at`。时间用 ISO 8601，默认生成 UTC 时间。其它普通文件可以留在同一目录树中。
 
 ## 备份
 
-ZIP 根目录包含 `oria-manifest.json` 和 `library/` 内的内容。格式 2 随笔记迁移全部文档历史、附件与相对路径。格式 1 可恢复已有笔记和附件，`.oria-history` 目录自格式 2 起保留。清单记录格式版本、目录、文件大小和 SHA-256。导入验证清单、CRC、哈希、路径、文件类型、文档及历史快照的 ID 和文件名哈希，再原子发布到空 vault。相同的备份可重复导入，有差异的非空目标返回冲突。完整备份由 CLI 显式操作。ZIP 完整性检查可检出损坏，格式没有签名或加密。历史快照保存的是 Markdown，当年的附件版本需在当年的完整 ZIP 中查找。
+ZIP 根目录包含 `oria-manifest.json` 和 `library/` 内的内容。格式 2 随笔记迁移全部文档历史、附件与相对路径。格式 1 可恢复已有笔记和附件，`.oria-history` 目录自格式 2 起保留。清单记录格式版本、目录、文件大小和 SHA-256。导入验证清单、CRC、哈希、路径、文件类型、文档及历史快照的 ID 和文件名哈希，再原子发布到空 vault。相同的备份可重复导入，有差异的非空目标返回冲突，导入过程不按名称删除文件。成功导入返回资产状态与 `index_status: rebuild_on_search`。目录刷盘失败时另附持久性告警。完整备份由 CLI 显式操作。ZIP 完整性检查可检出损坏，格式没有签名或加密。历史快照保存的是 Markdown，当年的附件版本需在当年的完整 ZIP 中查找。
 
 路径按大小写及 Unicode 等价检查重复，拒绝路径穿越、Windows 保留名称、链接和特殊文件。文件操作以本地用户专有的 vault 为边界。不要把 vault 或其上级目录交给同一台机器上的不受信任进程修改。
 
