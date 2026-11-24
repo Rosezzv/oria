@@ -1,5 +1,7 @@
 # ORIA
 
+简体中文 | [English](README.en.md)
+
 > **Your AI changes. Your knowledge stays.**
 
 **Local-first、Markdown-first、User-owned 的跨 Agent 个人知识资产层。**
