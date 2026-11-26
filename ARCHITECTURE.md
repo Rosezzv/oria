@@ -35,6 +35,14 @@ ZIP 根目录包含 `oria-manifest.json` 和 `library/` 内的内容。格式 2 
 
 路径按大小写及 Unicode 等价检查重复，拒绝路径穿越、Windows 保留名称、链接和特殊文件。文件操作以本地用户专有的 vault 为边界。不要把 vault 或其上级目录交给同一台机器上的不受信任进程修改。
 
+## 版本感知与只读升级指引（Alpha.3）
+
+- **独立于 Vault 的用户级状态**：版本检测与授权状态保存在 `~/.oria/update/`（支持 `ORIA_UPDATE_DIR` 覆盖），完全位于所有 ORIA Vault 之外（通过目录级真实路径包含检查与祖先 Vault 树识别，拒绝落入任意 Vault 或 `library/` 内部，同时不影响用户同名普通附件的完整 ZIP 备份）。跨进程写入通过 `~/.oria/update/lock.sqlite` 短锁配合 `state.json` 原子替换与短期 `in_flight_until` 租约协调；核心知识操作及后台刷新起始与收尾均采用无锁快照读取 + `timeout: 0` 立即放弃的非阻塞短锁，锁争用时直接丢弃或跳过提醒，确保事件循环与知识读写零阻塞。
+- **首次授权、严格离线与隐私边界**：默认 `consent: undecided`，在用户明确开启前不发起任何自动联网请求；状态缺失、损坏或字段不完整时默认回退离线（Fail-closed）。未回应首次提示时不擅自开启或永久拒绝（24 小时冷却、最多主动轻提示 3 次）；拒绝后零自动请求，并通过递增 `consent_epoch` 与 `AbortController` 停止后续未发请求、取消本进程在途请求并丢弃迟到响应（已发往网络的包本身不可撤回）。开启后按使用按需触发，每 24 小时最多尝试一次自动检测（固定仅查最新第一页 30 条，避免跨进程多页复杂性；手动 `check` 支持同源同路径有界分页最多 5 页共 150 条，并始终保留各渠道最佳版本；仅单页完整快照保留 ETag 并在无 ETag 的 200 时清除旧值）。网络请求仅匿名访问固定官方端点 `https://api.github.com/repos/Rosezzv/oria/releases?per_page=30`（静态 `User-Agent: ORIA-Update-Check`、禁止重定向、512 KiB 响应上限、区分读体超时与体积超限），不携带知识内容、路径、安装版本或设备标识（建立网络连接时 GitHub 仍会看到 IP 等常规网络信息）。外部 Release 正文直接丢弃，`published_at` 仅接受严格 ISO-8601 UTC 时间，`release_url` 始终按验证过的 Tag 重新生成。
+- **SemVer 2.0.0、渠道与跨渠道去重**：内置零依赖严格 SemVer 解析器（`src/semver.ts`，主次修订号与预发布数字标识均用 `BigInt` 比较，确保 `alpha.10 > alpha.9 > alpha.2`），排除 Draft、拒绝降级，并防御 GitHub `prerelease` 标志与标签语义不一致。`stable` 渠道仅接受正式版；`preview` 渠道接受 `alpha` / `beta` / `rc` 以及转正的正式版。明确区分 `update_available`、`up_to_date`、`no_eligible_release`、`check_failed` 与 `not_checked`。已提醒记录使用有界集合 `reminded_versions`（跨渠道不重复提醒；`snooze` 仅重臂当前目标版本）。
+- **接口兼容与非阻塞呈现**：MCP 知识工具保持 `content[0]`（JSON）与 `structuredContent` 与 Alpha.2 完全一致，按需追加 `content[2]` 可选 `ORIA_UPDATE_NOTICE`，且后台刷新通过 `setImmediate` 延后至当前工具返回之后（对核心工具零锁等待、零网络延迟），并在 MCP 传输关闭时取消在途请求以便干净退出。CLI `--json` 知识命令与非 TTY 管道命令保持零网络等待与零额外输出；仅交互终端 TTY 文本模式在 `stderr` 输出轻提示；Grok Bot 等 CLI 宿主可通过 `oria updates notice --json` 获取结构化提示。所有更新管理收口至统一 `oria_updates` MCP 工具与 `oria updates` CLI 子命令。
+- **只读升级指引（`src/upgrade-guide.ts`）**：Alpha.3 明确不做自动替换安装目录、进程管理或自动回退。`guide` 仅通过 `--no-optional-locks` 与禁用 `fsmonitor`/hooks 的只读 Git 元数据命令（不运行 `git status` 工作树扫描，从根本上避免触发仓库配置的内容过滤器或外部辅助程序，并显式返回 `worktree_status: "not_inspected"`）做保守分类，绝不暴露非官方 Git remote 原始地址。迁移与升级顺序统一为「确认路径 → 先停止所有写入者（Agent/MCP/编辑器）→ 导出最终 ZIP →（嵌套 Vault）恢复至独立空目录并核验 → 并排克隆构建 → 切换配置并重载/重导 Skill → 重启核验并保留旧资产」。
+
 ## 宿主接入依据
 
 - Claude Code 接受 stdio MCP，个人技能目录为 `~/.claude/skills`。[MCP](https://code.claude.com/docs/en/mcp) · [Skills](https://code.claude.com/docs/en/skills)

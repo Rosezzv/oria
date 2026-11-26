@@ -1,6 +1,6 @@
 {
   "name": "oria-local",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-alpha.3",
   "description": "Local-first Markdown knowledge across agents",
   "license": "MIT",
   "type": "module",

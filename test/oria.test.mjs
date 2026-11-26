@@ -27,8 +27,9 @@ function fixture(t) {
 }
 
 function cli(vault, args, options = {}) {
+  const env = { ...process.env, ORIA_UPDATE_DIR: join(vault, '..', '.oria-test-update'), ...options.env };
   const result = spawnSync(process.execPath, [entrypoint, '--vault', vault, '--json', ...args], {
-    encoding: 'utf8', ...options,
+    encoding: 'utf8', ...options, env,
   });
   assert.ifError(result.error);
   if (result.status !== 0) return { failed: JSON.parse(result.stderr).error };
@@ -381,6 +382,7 @@ async function mcp(t, vault, agent, workspace) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [entrypoint, '--vault', vault, 'mcp', ...agent ? ['--agent', agent] : []],
+    env: { ...process.env, ORIA_UPDATE_DIR: join(vault, '..', '.oria-test-update') },
     stderr: 'pipe',
   });
   t.after(() => client.close());
@@ -402,7 +404,7 @@ test('three MCP clients and CLI share one vault, using configured provenance and
   const unknown = await mcp(t, vault, 'unrecognized-host');
   const { tools } = await claude.listTools();
   assert.deepEqual(tools.map(tool => tool.name).sort(), [
-    'oria_archive', 'oria_history', 'oria_list', 'oria_read', 'oria_restore', 'oria_save', 'oria_search', 'oria_update',
+    'oria_archive', 'oria_history', 'oria_list', 'oria_read', 'oria_restore', 'oria_save', 'oria_search', 'oria_update', 'oria_updates',
   ]);
 
   const saved = (await tool(claude, 'save', {
@@ -596,7 +598,10 @@ test('save dedup respects archive/metadata, CLI displays archived status, extern
 
   // Archived note is not deduplicated against, and CLI human output marks [archived].
   succeeds(vault, ['archive', orig.id, '--expected-revision', orig.revision]);
-  const humanList = spawnSync(process.execPath, [entrypoint, '--vault', vault, 'list'], { encoding: 'utf8' });
+  const humanList = spawnSync(process.execPath, [entrypoint, '--vault', vault, 'list'], {
+    encoding: 'utf8',
+    env: { ...process.env, ORIA_UPDATE_DIR: join(root, '.oria-test-update') },
+  });
   assert.equal(humanList.status, 0);
   assert.match(humanList.stdout, /\[archived\]/);
 

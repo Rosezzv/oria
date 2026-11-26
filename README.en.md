@@ -149,7 +149,7 @@ Grok Bot executes its primary session in a cloud Linux VM and cannot attach dire
 > - If you also use a local terminal agent that supports stdio MCP (such as xAI's `Grok Build` / `grok mcp`), you can register `oria mcp --agent grok-bot --vault "$HOME/.oria/vault"` directly.
 > - Remote HTTPS MCP bridges (which require public endpoints and auth) are intentionally omitted in V0.1.
 
-### MCP Tools
+### MCP Tools (9 Tools)
 
 | Tool | Purpose |
 |---|---|
@@ -161,6 +161,31 @@ Grok Bot executes its primary session in a cloud Linux VM and cannot attach dire
 | `oria_archive` | Mark a note as archived using `expected_revision` (content remains searchable and readable) |
 | `oria_history` | List stored pre-write snapshots for a document UUID |
 | `oria_restore` | Restore a user-confirmed historical snapshot as a new revision using the current `expected_revision` |
+| `oria_updates` | Check current version/update status, run a manual check, opt in/out of daily checks, snooze, ignore a version, or show read-only safe upgrade guidance |
+
+---
+
+## Update Awareness & Guided Upgrade (Optional Network)
+
+ORIA stays **local-first**: update detection is a strictly optional, fully disableable capability. It **defaults to offline**, makes **zero automatic network requests before consent**, and runs **without any background daemon**. With update checks disabled, all core vault features run 100% offline.
+
+- **One-Time First-Use Consent**: After completing your first normal knowledge task, your agent briefly asks once whether to enable daily update reminders or stay offline. Declining stops future prompts and auto-checks; leaving it unanswered never opts you in or nags repeatedly; missing or corrupt consent files fail closed to offline.
+- **Privacy & Trust Boundaries**: When enabled, ORIA checks public GitHub Releases for `Rosezzv/oria` on demand at most once every 24 hours (including failed attempts). Automatic checks inspect page 1 (up to 30 most recent releases); explicit manual `check` scans up to 5 pages (up to 150 releases). Requests are anonymous with **no vault content, filenames, project names, vault paths, agent configs, installed version, device ID, or telemetry** (standard network metadata such as your IP address is still visible to GitHub when opening a connection). Disabling checks stops future/unsent requests across processes, cancels in-process requests, and discards late responses (requests already sent on the wire cannot be recalled). Remote release bodies are discarded and never treated as executable agent instructions.
+- **Cross-Agent Sharing & Non-Blocking Priority**: State lives outside the vault in `~/.oria/update/` (never included in ZIP backups, and blocked from residing inside any ORIA vault tree) so Claude Code, Codex, Antigravity, and Grok Bot share consent, deduplicate concurrent requests, and avoid repeating the same version across channels. Core knowledge operations always take priority: both background check startup and completion use fail-fast non-blocking locks so lock contention or network errors never stall reads, searches, or writes.
+- **Natural-Language Control**: Ask your agent directly (in English or Chinese):
+  - *"What version of ORIA am I running?"* / *"Check if ORIA has an update."* (one-time manual check never changes long-term opt-in)
+  - *"Remind me when ORIA has updates."* / *"Remind me later."* / *"Ignore this version."* / *"Stop checking for updates."*
+  - *"Show me how to upgrade ORIA."*
+- **Read-Only Guided Upgrade**:
+  - Alpha.3 intentionally **does not auto-replace installation directories, delete old folders, kill processes, or run automatic rollbacks**.
+  - `oria updates guide` / `oria_updates guide` performs a metadata-only read-only inspection (skipping worktree status scans so local Git content filters are never executed, and never exposing raw non-official Git remote URLs), then prints a consistent **side-by-side upgrade order** (shell snippets target macOS / Linux Bash/Zsh; adapt quoting on Windows PowerShell, which is not yet real-device verified):
+    1. Confirm your current install directory and vault path.
+    2. **First stop all Agents, ORIA MCP servers, CLI writers, and external editors** that may write to the vault.
+    3. Only after writes have stopped, run the final `oria export` backup.
+    4. If your vault overlaps the install directory (nested vault), restore that final ZIP into an empty, independent target directory (e.g. `~/.oria/vault`) and verify notes, latest revisions, history, and attachments there first.
+    5. Clone & build the official release tag side-by-side in a fresh directory (leaving your previous install untouched as your manual fallback).
+    6. Update Agent configs to the new `dist/cli.js` and independent `--vault` path (keep your existing independent path, or switch to the newly verified independent path if migrated from a nested vault), refresh and reload MCP Skills, and re-import Grok Bot's private Skill separately.
+    7. Restart Agents / reload MCP servers, verify the live running version and an existing note, and keep your previous install, old vault, and ZIP backup until verified.
 
 ---
 
@@ -184,6 +209,16 @@ oria history '<NOTE_UUID>'
 oria read '<NOTE_UUID>' --revision '<HISTORICAL_HASH>'
 oria restore '<NOTE_UUID>' --revision '<HISTORICAL_HASH>' --expected-revision '<CURRENT_HASH>'
 oria archive '<NOTE_UUID>' --expected-revision '<CURRENT_HASH>'
+
+# Version status, update checks, and read-only upgrade guidance
+oria updates status
+oria updates check                      # One-time manual check (does not change auto-check consent)
+oria updates enable --channel preview   # Enable daily checks (stable or preview channel)
+oria updates disable                    # Disable automatic checks (stay offline)
+oria updates snooze --days 7            # Defer reminders for 7 days
+oria updates ignore                     # Ignore the currently available version (higher versions still notify)
+oria updates notice                     # Emit any pending consent/update notice
+oria updates guide                      # Read-only inspection and safe side-by-side upgrade steps
 ```
 
 - `patch.json` must be JSON with exact `{"find":"original passage","replace":"updated passage"}` where `find` matches exactly once.

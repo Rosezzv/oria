@@ -96,6 +96,12 @@ export const restoreSchema = z.strictObject({ ...revisionCheck, revision: hashSc
 export const historySchema = z.strictObject({ id: idSchema, limit });
 export const listSchema = z.strictObject({ project: project.optional(), limit });
 export const searchSchema = z.strictObject({ query: label(240), project: project.optional(), limit });
+export const updatesSchema = z.strictObject({
+  action: z.enum(['status', 'check', 'enable', 'disable', 'snooze', 'ignore', 'guide']),
+  channel: z.enum(['stable', 'preview']).optional(),
+  days: z.int().min(1).max(90).optional(),
+  version: label(64).optional(),
+});
 
 const metadataSchema = z.object({
   oria_format: z.literal(1).optional(),

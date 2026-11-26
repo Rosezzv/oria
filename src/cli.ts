@@ -3,6 +3,11 @@ import { parseArgs } from 'node:util';
 import { exportVault, importVault } from './backup.js';
 import { agentFromConfig, appVersion, gitProject, limits, OriaError } from './domain.js';
 import { readExternalFile } from './filesystem.js';
+import {
+  checkForUpdatesManual, consumeAwarenessNotice, formatCliNoticeLine, getUpdateStatus, ignoreUpdateVersion,
+  maybeRunAutoCheck, setUpdateConsent, snoozeUpdates,
+} from './update.js';
+import { buildUpgradeGuide } from './upgrade-guide.js';
 import { Vault } from './vault.js';
 
 const help = [
@@ -21,6 +26,8 @@ const help = [
   'oria archive ID --expected-revision HASH [--allow-secrets]',
   'oria export',
   'oria import BACKUP.zip',
+  'oria updates [status|check|enable|disable|snooze|ignore|notice|guide]',
+  '             [--channel stable|preview] [--days N] [--version TAG]',
   'oria mcp [--agent claude-code|codex|antigravity|grok-bot]',
   '',
   'Global options: --vault DIR, --agent claude-code|codex|antigravity|grok-bot, --json, --help, --version (without a command)',
@@ -51,6 +58,8 @@ const options = {
   'clear-source': { type: 'boolean' },
   limit: { type: 'string' },
   agent: { type: 'string' },
+  channel: { type: 'string' },
+  days: { type: 'string' },
 } as const;
 
 const commandOptions: Record<string, string[]> = {
@@ -66,10 +75,12 @@ const commandOptions: Record<string, string[]> = {
   restore: ['revision', 'version', 'expected-revision', 'allow-rewrite', 'allow-secrets'],
   export: [],
   import: [],
+  updates: ['channel', 'days', 'version'],
   mcp: [],
 };
 
 const commandsWithArgument = new Set(['search', 'read', 'update', 'archive', 'import', 'history', 'restore']);
+const awarenessCommands = new Set(['save', 'search', 'read', 'update', 'list', 'archive', 'history', 'restore']);
 
 function required(value: string | undefined, name: string): string {
   if (!value?.trim()) throw new OriaError('INVALID_INPUT', 'Missing ' + name);
@@ -125,14 +136,22 @@ async function main(args: string[]) {
     return;
   }
   const { values, positionals } = parseArgs({ args, options, allowPositionals: true });
-  const [command, argument] = positionals;
+  const [command, argument, extraArgument] = positionals;
   if (values.help || !command) {
     console.log(help);
     return;
   }
   if (!Object.hasOwn(commandOptions, command)) throw new OriaError('INVALID_INPUT', 'Unknown command ' + command);
-  const expected = commandsWithArgument.has(command) ? 2 : 1;
-  if (positionals.length !== expected) throw new OriaError('INVALID_INPUT', 'Wrong number of arguments. See oria --help.');
+  if (command === 'updates') {
+    const sub = argument ?? 'status';
+    const validSubs = new Set(['status', 'check', 'enable', 'disable', 'snooze', 'ignore', 'notice', 'guide']);
+    if (!validSubs.has(sub)) throw new OriaError('INVALID_INPUT', 'Unknown updates subcommand ' + sub);
+    const maxArgs = sub === 'ignore' ? 3 : 2;
+    if (positionals.length > maxArgs) throw new OriaError('INVALID_INPUT', 'Wrong number of arguments. See oria --help.');
+  } else {
+    const expected = commandsWithArgument.has(command) ? 2 : 1;
+    if (positionals.length !== expected) throw new OriaError('INVALID_INPUT', 'Wrong number of arguments. See oria --help.');
+  }
   const allowed = new Set(['vault', 'json', 'agent', ...commandOptions[command]!]);
   for (const option of Object.keys(values)) {
     if (!allowed.has(option)) throw new OriaError('INVALID_INPUT', '--' + option + ' is unavailable for ' + command);
@@ -141,6 +160,97 @@ async function main(args: string[]) {
   // Grok Bot & CLI adapter provenance support:
   // accepts --agent or ORIA_AGENT, falling back to 'unknown' when unset or unrecognized.
   const agent = agentFromConfig(values.agent ?? process.env.ORIA_AGENT);
+  const output = (result: unknown, display: string) => console.log(values.json ? JSON.stringify(result) : display);
+
+  if (command === 'updates') {
+    const sub = argument ?? 'status';
+    const parseChannel = (): 'stable' | 'preview' | undefined => {
+      if (values.channel === undefined) return undefined;
+      if (values.channel !== 'stable' && values.channel !== 'preview') {
+        throw new OriaError('INVALID_INPUT', 'Channel must be stable or preview');
+      }
+      return values.channel;
+    };
+    const parseDays = (): number | undefined => {
+      if (values.days === undefined) return undefined;
+      if (!/^\d+$/.test(values.days)) throw new OriaError('INVALID_INPUT', 'Days must be an integer between 1 and 90');
+      return Number(values.days);
+    };
+    const formatStatus = (s: ReturnType<typeof getUpdateStatus>) => [
+      `ORIA version: ${s.current_version}`,
+      `Auto-check: ${s.consent} (channel: ${s.channel})`,
+      `Status: ${s.availability_status}`,
+      s.available_update
+        ? `Update available: ${s.available_update.tag} (${s.available_update.release_url})`
+        : 'Update available: none',
+      s.last_check_status ? `Last check: ${s.last_check_status}` + (s.last_check_error ? ` (${s.last_check_error})` : '') : '',
+      s.snoozed_until ? `Snoozed until: ${s.snoozed_until}` : '',
+      s.ignored_version ? `Ignored version: ${s.ignored_version}` : '',
+    ].filter(Boolean).join('\n');
+
+    switch (sub) {
+      case 'status': {
+        const result = getUpdateStatus({ vaultPath: path });
+        output(result, formatStatus(result));
+        return;
+      }
+      case 'check': {
+        const result = await checkForUpdatesManual({ vaultPath: path, channel: parseChannel() });
+        const suffix = result.throttled ? `\n(Cached result; retry in ~${result.retry_after_seconds}s)` : '';
+        output(result, formatStatus(result) + suffix);
+        return;
+      }
+      case 'enable': {
+        const result = setUpdateConsent(true, parseChannel(), { vaultPath: path });
+        output(result, 'Automatic update checks enabled.\n' + formatStatus(result));
+        return;
+      }
+      case 'disable': {
+        const result = setUpdateConsent(false, undefined, { vaultPath: path });
+        output(result, 'Automatic update checks disabled (offline mode).\n' + formatStatus(result));
+        return;
+      }
+      case 'snooze': {
+        const result = snoozeUpdates(parseDays(), { vaultPath: path });
+        output(result, `Update reminders snoozed until ${result.snoozed_until}.`);
+        return;
+      }
+      case 'ignore': {
+        const result = ignoreUpdateVersion(extraArgument ?? values.version, { vaultPath: path });
+        output(result, `Ignored ORIA version ${result.ignored_version}. Newer releases will still notify.`);
+        return;
+      }
+      case 'notice': {
+        await maybeRunAutoCheck({ vaultPath: path, timeoutMs: 1500, nonBlockingLock: true });
+        const notice = consumeAwarenessNotice({ vaultPath: path, nonBlockingLock: true });
+        const status = getUpdateStatus({ vaultPath: path });
+        output({ current_version: status.current_version, notice }, notice ? formatCliNoticeLine(notice) : 'No update notice pending.');
+        return;
+      }
+      case 'guide': {
+        const result = buildUpgradeGuide({ vaultPath: path, targetVersion: values.version });
+        const lines = [
+          `Current: ${result.current_version}` + (result.target_tag ? ` -> Target: ${result.target_tag}` : ` (${result.availability_status})`),
+          `Release URL: ${result.release_url}`,
+          `Install: ${result.install.install_kind} (${result.install.install_dir})` +
+            (result.install.reason ? ` — ${result.install.reason}` : ''),
+          `Vault: ${result.vault_path}` + (result.vault_overlaps_install ? ' [OVERLAPS INSTALL DIR]' : ''),
+          ...(result.warnings.length ? ['', 'Warnings:', ...result.warnings.map(w => '- ' + w)] : []),
+          '',
+          'Guided Upgrade Steps (read-only — ORIA does not auto-modify install directories):',
+          ...result.steps.map(step => '- ' + step),
+          '',
+          'Verification:',
+          ...result.verification_steps.map(step => '- ' + step),
+          '',
+          'Skills:',
+          ...result.skill_notes.map(note => '- ' + note),
+        ];
+        output(result, lines.join('\n'));
+        return;
+      }
+    }
+  }
 
   if (command === 'mcp') {
     const { startMcp } = await import('./mcp.js');
@@ -151,7 +261,6 @@ async function main(args: string[]) {
   const limit = values.limit === undefined ? undefined : /^\d+$/.test(values.limit) ? Number(values.limit) : NaN;
   const expectation = { expected_revision: values['expected-revision'], version: values.version };
   const writeOptions = { allowRewrite: values['allow-rewrite'], allowSecrets: values['allow-secrets'] };
-  const output = (result: unknown, display: string) => console.log(values.json ? JSON.stringify(result) : display);
   const vault = new Vault(path, agent);
   switch (command) {
     case 'init': {
@@ -239,6 +348,13 @@ async function main(args: string[]) {
         (result.durability_warning ? '\nWarning: ' + result.durability_warning : ''));
       break;
     }
+  }
+  const isInteractiveTty = Boolean(process.stdout.isTTY && process.stderr.isTTY);
+  if (!values.json && isInteractiveTty && awarenessCommands.has(command)) {
+    // Only interactive terminal sessions show cached/bounded notices on stderr; pipes and --json stay 0ms/silent.
+    await maybeRunAutoCheck({ vaultPath: path, timeoutMs: 800, nonBlockingLock: true });
+    const notice = consumeAwarenessNotice({ vaultPath: path, nonBlockingLock: true });
+    if (notice) console.error(formatCliNoticeLine(notice));
   }
 }
 

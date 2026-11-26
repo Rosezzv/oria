@@ -148,7 +148,7 @@ Grok Bot 的核心 Agent 运行在云端 Linux VM 中，无法直接连接本机
 > - 若你同时使用支持本地 stdio MCP 的终端工具（如 xAI `Grok Build` 的 `grok mcp`），也可以直接注册 `oria mcp --agent grok-bot --vault "$HOME/.oria/vault"`；
 > - 如需在 Mac 离线/未开桌面端时从云端访问，才需要考虑 Remote HTTPS MCP Bridge（需公网出口与鉴权），V0.1 默认不引入。
 
-### 使用的 8 个 MCP 工具
+### 使用的 9 个 MCP 工具
 
 | 工具名 | 用途 |
 |---|---|
@@ -160,6 +160,31 @@ Grok Bot 的核心 Agent 运行在云端 Linux VM 中，无法直接连接本机
 | `oria_archive` | 基于 `expected_revision` 归档文档（内容仍可搜索和读取） |
 | `oria_history` | 列出指定文档已保存的历史快照 |
 | `oria_restore` | 预览并经确认后，基于当前 `expected_revision` 恢复历史快照为新版本 |
+| `oria_updates` | 查看当前版本与更新状态、手动检查更新、开启/关闭自动提醒、稍后提醒、忽略指定版本，以及生成只读安全升级指引 |
+
+---
+
+## 更新提醒与安全升级指引（可选联网）
+
+ORIA 保持 **Local-first** 原则：版本检测是一个明确独立、可完全关闭的可选能力，**默认保持离线，未经你同意不会自动联网**，也不会引入常驻后台守护进程。关闭更新检测后，ORIA 的全部核心知识库能力完全离线运行。
+
+- **首次一次性授权**：首次正常使用 ORIA 完成知识操作后，Agent 会简短询问是否开启每日版本检测；你可以选择开启或保持离线（拒绝后不再反复询问，未回应时也不会反复打扰，授权配置缺失或损坏时默认保持离线）。
+- **隐私与安全边界**：开启后仅在你实际使用 ORIA 时按需检测，每 24 小时最多向官方公开仓库（`Rosezzv/oria`）GitHub Releases 发送一次匿名请求（自动检测仅查询最新第一页最多 30 个 Release；手动 `check` 最多有界分页查询 5 页共 150 个 Release），**不上传知识库内容、文件名、项目名、Vault 路径、Agent 配置、当前安装版本或设备标识**，不含任何遥测或追踪（建立网络连接时，GitHub 仍会接收到常规网络信息如 IP 地址）。关闭后停止所有未发出的自动请求、取消当前进程内未完成的请求并丢弃迟到响应（已经发往网络的请求本身无法撤回）。外部 Release 正文会被丢弃，绝不作为 Agent 指令执行。
+- **跨 Agent 共享与去重**：授权与检测缓存保存在 Vault 之外的 `~/.oria/update/`（永不进入知识库 ZIP；严格禁止指向任意 ORIA Vault 目录树内部），Claude Code、Codex、Antigravity 与 Grok Bot 共享同一状态，避免重复请求和同一版本跨渠道重复提醒。知识操作拥有最高优先级，后台更新起始与落盘均采用非阻塞尝试，锁争用或网络异常时直接跳过提醒而不阻塞读写检索。
+- **自然语言交互**：直接对 Agent 说即可（中英文均支持）：
+  - 「我现在用的是哪个版本？」「帮我看看 ORIA 有没有新版本。」（手动单次检查不改变长期授权状态）
+  - 「以后 ORIA 有更新就提醒我。」「暂时不要提醒我。」「忽略这个版本。」「以后不用检查更新了。」
+  - 「帮我看看怎么升级 ORIA。」
+- **只读升级指引（Guided Upgrade）**：
+  - Alpha.3 **不提供自动替换安装目录、自动删除旧目录、自动终止进程或自动回退**，避免引入程序生命周期管理复杂度与数据安全风险。
+  - 当你询问如何升级时，ORIA 通过安全的只读 Git 元数据预检（`oria updates guide` / `oria_updates guide`；不扫描工作树文件以免触发本地 Git 内容过滤器，也不暴露非官方 Git remote 原始地址）确认当前版本、安装类别与 Vault 路径，并提供保守、一致的**并排安全升级顺序**（示例命令面向 macOS / Linux Bash/Zsh，Windows PowerShell 需按平台语法调整且尚未真机验证）：
+    1. 确认当前程序安装目录与 Vault 路径；
+    2. **先停止所有可能写入该 Vault 的 Agent、ORIA MCP Server、CLI 会话及外部编辑器**；
+    3. 确认停止写入后，再执行最终 `oria export` 生成完整 ZIP 备份；
+    4. 若 Vault 与安装目录重叠（嵌套 Vault），先将最终 ZIP 恢复至独立、空白且安全的目标目录（如 `~/.oria/vault`），核对文档、最新修订、历史快照及附件完整性；
+    5. 在独立新目录克隆并构建官方 Release Tag（保留旧目录作为手工回退）；
+    6. 将各 Agent 配置指向新版 `dist/cli.js` 与独立 `--vault` 路径（已有独立 Vault 沿用原路径；嵌套 Vault 切换至已核验的新独立路径），更新并重新加载 MCP Skill（Grok Bot 需单独重新导入私有 Skill）；
+    7. 重启 Agent / 重载 MCP，核验实际运行版本与已有笔记，验证通过前保留原有安装目录、旧 Vault 与备份。
 
 ---
 
@@ -183,6 +208,16 @@ oria history '<笔记 UUID>'
 oria read '<笔记 UUID>' --revision '<历史 Hash>'
 oria restore '<笔记 UUID>' --revision '<历史 Hash>' --expected-revision '<当前 Hash>'
 oria archive '<笔记 UUID>' --expected-revision '<当前 Hash>'
+
+# 版本状态、更新检测与只读升级指引
+oria updates status
+oria updates check                      # 单次手动检查（不改变长期自动检测开关）
+oria updates enable --channel preview   # 开启每日检测（可选 stable 或 preview 渠道）
+oria updates disable                    # 关闭自动检测，保持纯离线
+oria updates snooze --days 7            # 7 天后再提醒
+oria updates ignore                     # 忽略当前提醒的版本（更高版本仍会提醒）
+oria updates notice                     # 检查并输出当前待显示的更新/授权提示
+oria updates guide                      # 只读检查当前环境并生成安全的并排升级指引
 ```
 
 - `patch.json` 格式为 `{"find":"原文片段","replace":"新片段"}`，`find` 必须在原文中恰好匹配一次。
